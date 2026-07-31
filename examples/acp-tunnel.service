@@ -1,0 +1,25 @@
+[Unit]
+Description=ACP Tunnel Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=acp-tunnel
+Group=acp-tunnel
+EnvironmentFile=/etc/acp-tunnel/environment
+ExecStart=/usr/local/bin/acp-tunnel serve --config /etc/acp-tunnel/config.toml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/workspaces
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
