@@ -208,6 +208,7 @@ reconnect timeout does not exceed the server grace period.
 
 - [Tunnel protocol](docs/protocol.md)
 - [Configuration reference](docs/configuration.md)
+- [Docker Compose deployment](docs/docker-compose.md)
 - [Example configuration](examples/config.toml)
 - [systemd service](examples/acp-tunnel.service)
 - [Nginx reverse proxy](examples/nginx.conf)
