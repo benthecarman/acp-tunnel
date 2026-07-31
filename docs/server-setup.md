@@ -5,10 +5,10 @@ keeps its listener on loopback. A separate TLS proxy provides remote access.
 
 ## Install the command
 
-Install stable Rust. Then run this command from the `acp-tunnel` checkout:
+Install stable Rust. Then install the published package:
 
 ```sh
-cargo install --path . --locked
+cargo install acp-tunnel --locked
 ```
 
 Make sure that the installed command has the expected path:

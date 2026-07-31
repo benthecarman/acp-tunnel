@@ -39,14 +39,14 @@ This is not the official ACP remote HTTP transport.
 
 ## Quick start
 
-Install stable Rust on the server and the client. Run this command from the
-same `acp-tunnel` checkout on both machines:
+Install stable Rust on the server and the client. Then install the published
+package on both machines:
 
 ```sh
-cargo install --path . --locked
+cargo install acp-tunnel --locked
 ```
 
-Make sure that the installed command is available:
+Make sure that both machines use the same version:
 
 ```sh
 command -v acp-tunnel
