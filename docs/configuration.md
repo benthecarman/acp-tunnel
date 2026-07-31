@@ -97,8 +97,23 @@ suffix matching occurs.
 must also select `mcp_policy = "passthrough"`. Passthrough allows the client to
 provide commands and environment values that the remote agent may execute.
 
-The bearer token is not part of TOML. It is read only from
-`ACP_TUNNEL_TOKEN`.
+The bearer token is not part of TOML. Both `connect` and `serve` use these
+credential sources, in this order:
+
+1. The CLI `--token-file` path.
+2. The `ACP_TUNNEL_TOKEN_FILE` path.
+3. The direct `ACP_TUNNEL_TOKEN` value.
+
+Do not provide a token file and `ACP_TUNNEL_TOKEN` together. The commands reject
+missing credentials and empty credentials. A token file must be 16 KiB or
+smaller. It can end with one LF or CRLF. Other spaces remain part of the token.
+Embedded newlines are invalid.
+
+On Unix, the command warns when a token file is group-readable or
+world-readable. It does not reject the file because container secret mounts can
+require group-readable permissions.
+
+The CLI accepts only a token-file path. It never accepts a token value.
 
 Resume credentials are generated per tunnel, kept only in server and connector
 memory, compared in constant time, and never configured or logged. Set

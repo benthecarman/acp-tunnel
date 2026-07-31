@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 #![doc = "Command-line entry point for acp-tunnel."]
 
-use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
 use acp_tunnel::{
     Error, Result,
     auth::StaticTokenAuthenticator,
     client::{ConnectOptions, connect},
     config::ServerConfig,
+    credentials::load_token,
     server::{ServerState, serve},
 };
 use clap::{Parser, Subcommand};
@@ -59,6 +60,9 @@ enum Command {
         /// Maximum time spent reconnecting a detached tunnel.
         #[arg(long, default_value_t = 30)]
         reconnect_timeout_seconds: u64,
+        /// Read the bearer credential from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Serve configured ACP agents over authenticated WebSockets.
     Serve {
@@ -71,6 +75,9 @@ enum Command {
         /// Permit plaintext HTTP on a non-loopback listener.
         #[arg(long)]
         insecure_listen: bool,
+        /// Read the bearer credential from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Parse and validate a server configuration without starting a server.
     CheckConfig {
@@ -107,8 +114,9 @@ async fn run() -> Result<()> {
             connect_timeout_seconds,
             keepalive_timeout_seconds,
             reconnect_timeout_seconds,
+            token_file,
         } => {
-            let token = required_token()?;
+            let token = load_token(token_file.as_deref())?;
             connect(ConnectOptions {
                 url,
                 agent,
@@ -127,6 +135,7 @@ async fn run() -> Result<()> {
             config,
             listen,
             insecure_listen,
+            token_file,
         } => {
             init_server_logging()?;
             let mut config = ServerConfig::load(config)?;
@@ -134,7 +143,7 @@ async fn run() -> Result<()> {
                 config.listen = listen;
             }
             config.validate()?;
-            let token = required_token()?;
+            let token = load_token(token_file.as_deref())?;
             let shutdown = CancellationToken::new();
             let signal_shutdown = shutdown.clone();
             tokio::spawn(async move {
@@ -160,17 +169,6 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::TestAgent => run_test_agent().await,
-    }
-}
-
-fn required_token() -> Result<String> {
-    let token = env::var("ACP_TUNNEL_TOKEN").map_err(|_| {
-        Error::Config("ACP_TUNNEL_TOKEN must be set and is never accepted as a CLI argument".into())
-    })?;
-    if token.is_empty() {
-        Err(Error::Config("ACP_TUNNEL_TOKEN must not be empty".into()))
-    } else {
-        Ok(token)
     }
 }
 

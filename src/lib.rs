@@ -8,6 +8,8 @@ pub mod auth;
 pub mod client;
 /// Server-owned TOML configuration.
 pub mod config;
+/// Tunnel credential loading and secret representation.
+pub mod credentials;
 /// Typed library errors.
 pub mod error;
 /// Narrow ACP workspace and MCP policy transformations.

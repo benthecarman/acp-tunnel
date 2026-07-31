@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
 
+use crate::credentials::SecretToken;
+
 /// Authenticates an HTTP bearer credential.
 pub trait Authenticator: Send + Sync {
     /// Returns true only when the credential is authorized.
@@ -11,14 +13,14 @@ pub trait Authenticator: Send + Sync {
 /// Constant-time authenticator backed by one static token.
 #[derive(Clone)]
 pub struct StaticTokenAuthenticator {
-    expected: Arc<[u8]>,
+    expected: Arc<SecretToken>,
 }
 
 impl StaticTokenAuthenticator {
     /// Creates an authenticator. The token value is never formatted or logged.
-    pub fn new(token: impl AsRef<[u8]>) -> Self {
+    pub fn new(token: SecretToken) -> Self {
         Self {
-            expected: Arc::from(token.as_ref()),
+            expected: Arc::new(token),
         }
     }
 }
@@ -26,12 +28,13 @@ impl StaticTokenAuthenticator {
 impl Authenticator for StaticTokenAuthenticator {
     fn authenticate(&self, bearer_token: &str) -> bool {
         let supplied = bearer_token.as_bytes();
-        let same_length = (supplied.len() as u64).ct_eq(&(self.expected.len() as u64));
+        let expected = self.expected.expose().as_bytes();
+        let same_length = (supplied.len() as u64).ct_eq(&(expected.len() as u64));
         let mut difference = 0_u8;
-        let maximum = supplied.len().max(self.expected.len());
+        let maximum = supplied.len().max(expected.len());
         for index in 0..maximum {
             let left = supplied.get(index).copied().unwrap_or_default();
-            let right = self.expected.get(index).copied().unwrap_or_default();
+            let right = expected.get(index).copied().unwrap_or_default();
             difference |= left ^ right;
         }
         bool::from(same_length & difference.ct_eq(&0))
@@ -55,9 +58,13 @@ pub fn parse_bearer(header: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn token(value: &str) -> SecretToken {
+        SecretToken::new(value.to_owned()).unwrap()
+    }
+
     #[test]
     fn accepts_only_the_correct_token() {
-        let auth = StaticTokenAuthenticator::new("correct");
+        let auth = StaticTokenAuthenticator::new(token("correct"));
         assert!(auth.authenticate("correct"));
         assert!(!auth.authenticate("wrong"));
         assert!(!auth.authenticate("correct-but-longer"));

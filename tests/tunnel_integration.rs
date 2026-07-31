@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Duration};
 use acp_tunnel::{
     auth::StaticTokenAuthenticator,
     config::ServerConfig,
+    credentials::SecretToken,
     protocol::{ClientInfo, Envelope, ResumeRequest, TUNNEL_VERSION},
     server::{ServerState, router},
 };
@@ -70,7 +71,9 @@ impl TestServer {
         let shutdown = CancellationToken::new();
         let state = ServerState::new(
             Arc::new(config),
-            Arc::new(StaticTokenAuthenticator::new("integration-secret")),
+            Arc::new(StaticTokenAuthenticator::new(
+                SecretToken::new("integration-secret".into()).unwrap(),
+            )),
             shutdown.clone(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

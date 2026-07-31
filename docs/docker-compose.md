@@ -100,13 +100,16 @@ services:
         AGENT_IMAGE: ${AGENT_IMAGE:?Set AGENT_IMAGE}
     command:
       - serve
+      - --token-file
+      - /run/secrets/acp-tunnel-token
       - --config
       - /etc/acp-tunnel/config.toml
       - --insecure-listen
     environment:
-      ACP_TUNNEL_TOKEN: ${ACP_TUNNEL_TOKEN:?Set ACP_TUNNEL_TOKEN}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-acp_tunnel=info}
+    secrets:
+      - acp-tunnel-token
     volumes:
       - ./deploy/config.toml:/etc/acp-tunnel/config.toml:ro
       - /srv/workspaces/project-a:/srv/workspaces/project-a:rw
@@ -120,6 +123,10 @@ services:
     cap_drop:
       - ALL
     pids_limit: 512
+
+secrets:
+  acp-tunnel-token:
+    file: ./deploy/acp-tunnel-token
 ```
 
 This example publishes the server only on the host loopback interface. A host
@@ -142,10 +149,11 @@ Set the existing agent image:
 export AGENT_IMAGE='your-registry.example/team/codex-acp:approved-tag'
 ```
 
-Set a long random bearer token:
+Create a file that contains a long random bearer token:
 
 ```sh
-export ACP_TUNNEL_TOKEN="$(openssl rand -hex 32)"
+openssl rand -hex 32 > deploy/acp-tunnel-token
+chmod 0600 deploy/acp-tunnel-token
 ```
 
 Set the agent credential:
@@ -216,7 +224,7 @@ Install `acp-tunnel` on the client host or in the ACP client container. Configur
 the ACP client to run:
 
 ```sh
-ACP_TUNNEL_TOKEN='the-same-bearer-token' \
+ACP_TUNNEL_TOKEN_FILE="$HOME/.config/acp-tunnel/token" \
   acp-tunnel connect \
   --url wss://agents.example.com/v1/tunnel \
   --agent codex \
@@ -293,8 +301,8 @@ configured command. Use an absolute command path if `PATH` does not contain it.
 access the mounted workspace. Make sure that the container path matches
 `[workspaces]`.
 
-**Authentication fails:** Set the same `ACP_TUNNEL_TOKEN` for the service and
-the local connector. Make sure that the proxy forwards the header unchanged.
+**Authentication fails:** Load the same token for the service and local
+connector. Make sure that the proxy forwards the header unchanged.
 
 **The agent loses its login:** Mount the required credential directory. Make
 the mount writable only when the agent must refresh its credential.

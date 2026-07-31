@@ -53,8 +53,8 @@ acp-tunnel check-config --config /etc/acp-tunnel/config.toml
 Start a loopback server behind a TLS reverse proxy:
 
 ```sh
-ACP_TUNNEL_TOKEN='replace-with-a-long-random-token' \
-  acp-tunnel serve \
+acp-tunnel serve \
+  --token-file /run/secrets/acp-tunnel-token \
   --listen 127.0.0.1:8787 \
   --config /etc/acp-tunnel/config.toml
 ```
@@ -84,16 +84,28 @@ ACP_TUNNEL_TOKEN='the-same-token' \
   --workspace project-a
 ```
 
+For applications that cannot safely set a token environment variable, use a
+token file:
+
+```sh
+ACP_TUNNEL_TOKEN_FILE="$HOME/.config/acp-tunnel/token" \
+  acp-tunnel connect \
+    --url wss://agents.example.com/v1/tunnel \
+    --agent codex \
+    --workspace project-a
+```
+
 There is no vendor-specific code. The names select server configuration only.
 Any ACP client that can launch a command can use the same executable, arguments,
 and environment.
 
 ## Security model
 
-The server authenticates the HTTP upgrade with a bearer token from
-`ACP_TUNNEL_TOKEN` before it accepts an opening request or starts a process.
-Tokens are compared in a constant-time padded loop. Tokens and authorization
-headers are never logged. The client does not follow redirects.
+The server authenticates the HTTP upgrade with a bearer token before it accepts
+an opening request or starts a process. Both commands use `--token-file`,
+`ACP_TUNNEL_TOKEN_FILE`, or `ACP_TUNNEL_TOKEN`. Tokens are compared in a
+constant-time padded loop. Tokens and authorization headers are never logged.
+The client does not follow redirects.
 
 The client supplies only an agent ID and workspace ID. The server owns every
 executable, argument, environment rule, and filesystem path. It clears the
@@ -185,8 +197,11 @@ See [`examples/nginx.conf`](examples/nginx.conf).
 local stdout. Put client diagnostics and wrapper output on stderr. Do not add
 shell startup messages around `acp-tunnel connect`.
 
-**401 Unauthorized:** Set the same nonempty `ACP_TUNNEL_TOKEN` in the local
-connector and remote service. Confirm the proxy forwards `Authorization`.
+**401 Unauthorized:** Load the same nonempty token in the connector and remote
+service. Make sure that the proxy forwards `Authorization`.
+
+**Token file fails to load:** Make sure that the path is readable and the file
+is 16 KiB or smaller. The file can end with one LF or CRLF.
 
 **Unknown or missing workspace:** Check the requested ID, the agent's
 `workspaces` list, and the remote path. No files are copied by the tunnel.

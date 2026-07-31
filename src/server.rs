@@ -40,6 +40,7 @@ use crate::{
     auth::{Authenticator, StaticTokenAuthenticator, parse_bearer},
     client::keepalive_nonce,
     config::ServerConfig,
+    credentials::SecretToken,
     policy::{AcpPolicy, PolicyOutcome},
     process::{AgentProcess, exit_details},
     protocol::{AckStream, Envelope, OpenRequest, TUNNEL_VERSION},
@@ -374,7 +375,8 @@ async fn resume_tunnel(
         fail_socket(&mut socket, "resume_rejected", &error).await;
         return Err(error);
     };
-    let token_authenticator = StaticTokenAuthenticator::new(entry.resume_token.as_bytes());
+    let token_authenticator =
+        StaticTokenAuthenticator::new(SecretToken::new(entry.resume_token.clone())?);
     if entry.agent != open.agent
         || entry.workspace != open.workspace
         || !token_authenticator.authenticate(&resume.resume_token)
@@ -1244,7 +1246,9 @@ mod tests {
         .unwrap();
         ServerState::new(
             Arc::new(config),
-            Arc::new(StaticTokenAuthenticator::new("secret")),
+            Arc::new(StaticTokenAuthenticator::new(
+                SecretToken::new("secret".into()).unwrap(),
+            )),
             CancellationToken::new(),
         )
     }

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -16,13 +18,23 @@ pub struct ClientInfo {
 }
 
 /// Credentials used to resume one detached tunnel.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeRequest {
     /// Opaque connection identifier returned by the original ready response.
     pub connection_id: String,
     /// Secret, single-session resume credential.
     pub resume_token: String,
+}
+
+impl fmt::Debug for ResumeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResumeRequest")
+            .field("connection_id", &self.connection_id)
+            .field("resume_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Identifies the direction acknowledged by an [`Envelope::Ack`].
@@ -36,7 +48,7 @@ pub enum AckStream {
 }
 
 /// Versioned messages exchanged over the tunnel WebSocket.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Envelope {
     /// Requests one configured agent and workspace.
@@ -112,6 +124,71 @@ pub enum Envelope {
         /// Opaque value copied from the ping.
         nonce: String,
     },
+}
+
+impl fmt::Debug for Envelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open {
+                tunnel_version,
+                agent,
+                workspace,
+                client_info,
+                resume,
+            } => formatter
+                .debug_struct("Open")
+                .field("tunnel_version", tunnel_version)
+                .field("agent", agent)
+                .field("workspace", workspace)
+                .field("client_info", client_info)
+                .field("resume", resume)
+                .finish(),
+            Self::Ready {
+                tunnel_version,
+                connection_id,
+                resume_token,
+                resumed,
+            } => formatter
+                .debug_struct("Ready")
+                .field("tunnel_version", tunnel_version)
+                .field("connection_id", connection_id)
+                .field("resume_token", &resume_token.as_ref().map(|_| "[REDACTED]"))
+                .field("resumed", resumed)
+                .finish(),
+            Self::Acp { sequence, .. } => formatter
+                .debug_struct("Acp")
+                .field("sequence", sequence)
+                .field("payload", &"[REDACTED]")
+                .finish(),
+            Self::Ack { stream, sequence } => formatter
+                .debug_struct("Ack")
+                .field("stream", stream)
+                .field("sequence", sequence)
+                .finish(),
+            Self::Stderr { .. } => formatter
+                .debug_struct("Stderr")
+                .field("payload", &"[REDACTED]")
+                .finish(),
+            Self::Exit { code, signal } => formatter
+                .debug_struct("Exit")
+                .field("code", code)
+                .field("signal", signal)
+                .finish(),
+            Self::Error { code, message } => formatter
+                .debug_struct("Error")
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            Self::Ping { nonce } => formatter
+                .debug_struct("Ping")
+                .field("nonce", nonce)
+                .finish(),
+            Self::Pong { nonce } => formatter
+                .debug_struct("Pong")
+                .field("nonce", nonce)
+                .finish(),
+        }
+    }
 }
 
 impl Envelope {
@@ -203,5 +280,40 @@ mod tests {
             resume: None,
         };
         assert!(matches!(open.into_open(), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn debug_redacts_resume_credentials_and_payloads() {
+        let open = Envelope::Open {
+            tunnel_version: TUNNEL_VERSION,
+            agent: "agent".into(),
+            workspace: "workspace".into(),
+            client_info: ClientInfo {
+                name: "test".into(),
+                version: "1".into(),
+            },
+            resume: Some(ResumeRequest {
+                connection_id: "connection".into(),
+                resume_token: "resume-debug-secret".into(),
+            }),
+        };
+        let ready = Envelope::Ready {
+            tunnel_version: TUNNEL_VERSION,
+            connection_id: "connection".into(),
+            resume_token: Some("ready-debug-secret".into()),
+            resumed: true,
+        };
+        let acp = Envelope::Acp {
+            sequence: Some(1),
+            payload: "payload-debug-secret".into(),
+        };
+        let formatted = format!("{open:?} {ready:?} {acp:?}");
+        for secret in [
+            "resume-debug-secret",
+            "ready-debug-secret",
+            "payload-debug-secret",
+        ] {
+            assert!(!formatted.contains(secret));
+        }
     }
 }

@@ -35,6 +35,14 @@ Reconnect uses a random, per-session resume capability in addition to the
 bearer token. Treat this capability as a secret. It is intentionally memory-only
 and expires when the session ends or its reconnect grace period elapses.
 
+Load the bearer token from `--token-file`, `ACP_TUNNEL_TOKEN_FILE`, or
+`ACP_TUNNEL_TOKEN`. A file keeps the token out of process environment listings
+and application configuration. Restrict the file permissions when the runtime
+does not require group-readable secret mounts.
+
+The token type has redacted `Debug` output. Authentication uses a constant-time
+comparison, and HTTP authorization headers are marked as sensitive.
+
 Do not include bearer tokens, authorization headers, ACP payloads, prompts,
 environment values, private keys, or MCP secrets in reports sent through public
 channels.

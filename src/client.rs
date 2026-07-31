@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     Error, Result,
     config::validate_id,
+    credentials::SecretToken,
     protocol::{AckStream, ClientInfo, Envelope, ResumeRequest, TUNNEL_VERSION},
 };
 
@@ -39,8 +40,8 @@ pub struct ConnectOptions {
     pub agent: String,
     /// Requested configured workspace identifier.
     pub workspace: String,
-    /// Bearer token read from the environment.
-    pub token: String,
+    /// Bearer credential loaded once during startup.
+    pub token: SecretToken,
     /// Maximum ACP line and WebSocket message size.
     pub max_frame_bytes: usize,
     /// Maximum locally retained unacknowledged ACP frames.
@@ -303,8 +304,9 @@ async fn open_socket(
     options: &ConnectOptions,
     resume: Option<&ResumeCredentials>,
 ) -> Result<(ClientSocket, ResumeCredentials)> {
-    let authorization = HeaderValue::from_str(&format!("Bearer {}", options.token))
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", options.token.expose()))
         .map_err(|_| Error::Config("token cannot be represented as an HTTP header".into()))?;
+    authorization.set_sensitive(true);
     let mut request = options
         .url
         .as_str()
@@ -483,6 +485,25 @@ mod tests {
         assert!(validate_connect_url(&Url::parse("wss://example.com/v1/tunnel").unwrap()).is_ok());
     }
 
+    #[test]
+    fn connect_options_debug_redacts_the_token() {
+        let options = ConnectOptions {
+            url: Url::parse("ws://127.0.0.1:8787/v1/tunnel").unwrap(),
+            agent: "fake".into(),
+            workspace: "project".into(),
+            token: SecretToken::new("connect-debug-secret".into()).unwrap(),
+            max_frame_bytes: 1024,
+            max_replay_frames: 8,
+            max_replay_bytes: 8192,
+            connection_timeout: Duration::from_secs(1),
+            keepalive_timeout: Duration::from_secs(1),
+            reconnect_timeout: Duration::from_secs(1),
+        };
+        let formatted = format!("{options:?}");
+        assert!(!formatted.contains("connect-debug-secret"));
+        assert!(formatted.contains("REDACTED"));
+    }
+
     #[tokio::test]
     async fn reconnect_replays_unacknowledged_client_frames() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -565,7 +586,7 @@ mod tests {
             url: Url::parse(&format!("ws://{address}/v1/tunnel")).unwrap(),
             agent: "fake".into(),
             workspace: "project".into(),
-            token: "token".into(),
+            token: SecretToken::new("token".into()).unwrap(),
             max_frame_bytes: 1024,
             max_replay_frames: 8,
             max_replay_bytes: 8192,
