@@ -95,6 +95,23 @@ ACP_TUNNEL_TOKEN_FILE="$HOME/.config/acp-tunnel/token" \
     --workspace project-a
 ```
 
+Some agents need values that the local ACP client selects for each connection.
+Select each local variable by name on the connector:
+
+```sh
+SESSION_ENDPOINT=https://session.example \
+SESSION_ACCESS_TOKEN=connection-secret \
+  acp-tunnel connect \
+    --url wss://agents.example.com/v1/tunnel \
+    --agent codex \
+    --workspace project-a \
+    --client-env SESSION_ENDPOINT \
+    --client-env SESSION_ACCESS_TOKEN
+```
+
+The selected agent configuration must list the same names in
+`client_env_allowlist`. The connector does not send other local variables.
+
 There is no vendor-specific code. The names select server configuration only.
 Any ACP client that can launch a command can use the same executable, arguments,
 and environment.
@@ -107,11 +124,16 @@ an opening request or starts a process. Both commands use `--token-file`,
 constant-time padded loop. Tokens and authorization headers are never logged.
 The client does not follow redirects.
 
-The client supplies only an agent ID and workspace ID. The server owns every
+The client supplies an agent ID and workspace ID. It can also offer variables
+that the connector selects with `--client-env`. The server owns every
 executable, argument, environment rule, and filesystem path. It clears the
-agent environment, copies only names in `pass_env`, adds fixed `env` values,
-sets the configured working directory, and invokes the executable directly
-without a shell.
+agent environment and copies only server-approved names. It invokes the
+executable directly without a shell.
+
+Agent `pass_env` and fixed `env` values take precedence over client values. An
+agent `client_env_allowlist` grants connection-specific control to authorized
+clients. The server rejects unlisted, duplicate, and malformed entries. It
+does not log environment values.
 
 Browser `Origin` headers are rejected unless their exact value appears in
 `allowed_origins`. Plaintext servers are restricted to loopback unless
@@ -237,6 +259,10 @@ workspace. Include `PATH` in `pass_env` when using an executable name.
 **MCP policy rejection:** Add the incoming MCP `name` under `[mcp_servers]`,
 choose `deny`, or use the explicitly insecure passthrough mode only for trusted
 clients.
+
+**Client environment rejection:** Add the selected name to the agent
+`client_env_allowlist`. Remove the corresponding `--client-env` option if the
+remote agent does not need the variable.
 
 **Proxy closes long sessions:** The connector should report a successful
 reconnect on stderr. Raise proxy read/send timeouts above the server keepalive

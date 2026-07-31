@@ -8,7 +8,10 @@ use acp_tunnel::{
     auth::StaticTokenAuthenticator,
     config::ServerConfig,
     credentials::SecretToken,
-    protocol::{ClientInfo, Envelope, ResumeRequest, TUNNEL_VERSION},
+    protocol::{
+        ClientEnvironment, ClientEnvironmentVariable, ClientInfo, Envelope, ResumeRequest,
+        TUNNEL_VERSION,
+    },
     server::{ServerState, router},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -67,6 +70,8 @@ impl TestServer {
             command = "{escaped_executable}"
             args = ["__test-agent"]
             workspaces = ["project"]
+            env = {{ SERVER_FIXED = "server-owned" }}
+            client_env_allowlist = ["SESSION_CREDENTIAL", "SERVER_FIXED"]
             mcp_policy = "deny"
 
             [workspaces.project]
@@ -124,6 +129,15 @@ impl TestServer {
         &self,
         resume: Option<ResumeRequest>,
     ) -> (TestSocket, ResumeRequest) {
+        self.connect_with_resume_and_environment(resume, ClientEnvironment::default())
+            .await
+    }
+
+    async fn connect_with_resume_and_environment(
+        &self,
+        resume: Option<ResumeRequest>,
+        client_environment: ClientEnvironment,
+    ) -> (TestSocket, ResumeRequest) {
         let mut socket = self.authenticated_socket().await;
         send(
             &mut socket,
@@ -135,6 +149,7 @@ impl TestServer {
                     name: "integration-test".into(),
                     version: "0".into(),
                 },
+                client_environment,
                 resume,
             },
         )
@@ -189,6 +204,7 @@ async fn assert_resume_rejected(server: &TestServer, resume: ResumeRequest) {
                 name: "integration-test".into(),
                 version: "0".into(),
             },
+            client_environment: ClientEnvironment::default(),
             resume: Some(resume),
         },
     )
@@ -396,6 +412,84 @@ async fn full_fake_agent_flow_is_bidirectional_and_propagates_exit() {
 }
 
 #[tokio::test]
+async fn explicitly_selected_agent_environment_is_allowlisted_and_server_owned() {
+    let server = TestServer::start().await;
+    let client_environment = ClientEnvironment::new(vec![
+        ClientEnvironmentVariable::new(
+            "SESSION_CREDENTIAL".into(),
+            "client-selected-secret".into(),
+        ),
+        ClientEnvironmentVariable::new("SERVER_FIXED".into(), "client-override".into()),
+    ]);
+    let (mut socket, _) = server
+        .connect_with_resume_and_environment(None, client_environment)
+        .await;
+
+    for (sequence, name, expected) in [
+        (1, "SESSION_CREDENTIAL", Some("client-selected-secret")),
+        (2, "SERVER_FIXED", Some("server-owned")),
+        (3, "USER", None),
+    ] {
+        let id = format!("environment-{sequence}");
+        send_acp(
+            &mut socket,
+            sequence,
+            json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":"test/environment",
+                "params":{"name":name}
+            }),
+        )
+        .await;
+        let response = receive_acp_with_id(&mut socket, &id).await;
+        assert_eq!(response["result"]["value"].as_str(), expected);
+    }
+
+    send(
+        &mut socket,
+        Envelope::Shutdown {
+            reason: acp_tunnel::protocol::ShutdownReason::ClientShutdown,
+        },
+    )
+    .await;
+    let _ = receive_shutdown_complete(&mut socket).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn unlisted_agent_environment_is_rejected_without_disclosing_values() {
+    let server = TestServer::start().await;
+    let mut socket = server.authenticated_socket().await;
+    send(
+        &mut socket,
+        Envelope::Open {
+            tunnel_version: TUNNEL_VERSION,
+            agent: "fake".into(),
+            workspace: "project".into(),
+            client_info: ClientInfo {
+                name: "integration-test".into(),
+                version: "0".into(),
+            },
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "UNLISTED".into(),
+                "do-not-disclose".into(),
+            )]),
+            resume: None,
+        },
+    )
+    .await;
+    match receive_raw(&mut socket).await {
+        Envelope::Error { code, message } => {
+            assert_eq!(code, "client_environment_rejected");
+            assert!(!message.contains("do-not-disclose"));
+        }
+        other => panic!("expected client environment rejection, got {other:?}"),
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn transport_disconnect_preserves_child_for_authenticated_resume() {
     let server = TestServer::start().await;
     let (mut first, resume) = server.connect_with_resume(None).await;
@@ -520,6 +614,33 @@ async fn invalid_resume_capability_is_rejected_without_disrupting_the_session() 
     let (mut initial, resume) = server.connect_with_resume(None).await;
     initial.close(None).await.unwrap();
 
+    let mut changed_environment = server.authenticated_socket().await;
+    send(
+        &mut changed_environment,
+        Envelope::Open {
+            tunnel_version: TUNNEL_VERSION,
+            agent: "fake".into(),
+            workspace: "project".into(),
+            client_info: ClientInfo {
+                name: "integration-test".into(),
+                version: "0".into(),
+            },
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "SESSION_CREDENTIAL".into(),
+                "replacement-secret".into(),
+            )]),
+            resume: Some(resume.clone()),
+        },
+    )
+    .await;
+    match receive_raw(&mut changed_environment).await {
+        Envelope::Error { code, message } => {
+            assert_eq!(code, "resume_rejected");
+            assert!(!message.contains("replacement-secret"));
+        }
+        other => panic!("expected environment-changing resume rejection, got {other:?}"),
+    }
+
     let mut invalid = server.authenticated_socket().await;
     let mut bad_resume = resume.clone();
     bad_resume.resume_token.push_str("-incorrect");
@@ -533,6 +654,7 @@ async fn invalid_resume_capability_is_rejected_without_disrupting_the_session() 
                 name: "integration-test".into(),
                 version: "0".into(),
             },
+            client_environment: ClientEnvironment::default(),
             resume: Some(bad_resume),
         },
     )
@@ -573,6 +695,7 @@ async fn tunnel_protocol_version_two_is_rejected_clearly() {
                 name: "integration-test".into(),
                 version: "0".into(),
             },
+            client_environment: ClientEnvironment::default(),
             resume: None,
         },
     )
@@ -602,10 +725,13 @@ async fn connect_command_keeps_stdout_protocol_pure() {
             "fake",
             "--workspace",
             "project",
+            "--client-env",
+            "SESSION_CREDENTIAL",
             "--shutdown-timeout-seconds",
             "3",
         ])
         .env("ACP_TUNNEL_TOKEN", "integration-secret")
+        .env("SESSION_CREDENTIAL", "cli-selected-secret")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -616,6 +742,7 @@ async fn connect_command_keeps_stdout_protocol_pure() {
     stdin
         .write_all(
             br#"{"jsonrpc":"2.0","id":"client-init","method":"initialize","params":{}}
+{"jsonrpc":"2.0","id":"client-environment","method":"test/environment","params":{"name":"SESSION_CREDENTIAL"}}
 "#,
         )
         .await
@@ -631,6 +758,17 @@ async fn connect_command_keeps_stdout_protocol_pure() {
     assert_eq!(
         message["result"]["agentInfo"]["name"],
         "acp-tunnel-test-agent"
+    );
+    line.clear();
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let environment: Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(environment["id"], "client-environment");
+    assert_eq!(
+        environment["result"]["value"],
+        Value::String("cli-selected-secret".into())
     );
     stdin.shutdown().await.unwrap();
     drop(stdin);

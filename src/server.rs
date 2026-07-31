@@ -202,7 +202,7 @@ struct TransportHandle {
 }
 
 async fn run_tunnel(mut socket: WebSocket, state: ServerState) {
-    let open = match read_open(&mut socket, &state).await {
+    let mut open = match read_open(&mut socket, &state).await {
         Ok(open) => open,
         Err(error) => {
             warn!(
@@ -238,6 +238,7 @@ async fn run_tunnel(mut socket: WebSocket, state: ServerState) {
             return;
         }
     };
+    open.client_environment.clear();
 
     let resume_token = new_resume_token();
     let (attachment_tx, attachment_rx) = mpsc::channel(2);
@@ -343,10 +344,15 @@ async fn prepare_agent(
             return Err(error);
         }
     };
-    let process = match AgentProcess::spawn(agent, &workspace.path) {
+    let process = match AgentProcess::spawn(agent, &workspace.path, &open.client_environment) {
         Ok(process) => process,
         Err(error) => {
-            fail_socket(socket, "agent_start_failed", &error).await;
+            let code = if matches!(&error, Error::Protocol(_)) {
+                "client_environment_rejected"
+            } else {
+                "agent_start_failed"
+            };
+            fail_socket(socket, code, &error).await;
             return Err(error);
         }
     };
@@ -364,6 +370,11 @@ async fn resume_tunnel(
     state: &ServerState,
     open: OpenRequest,
 ) -> Result<()> {
+    if !open.client_environment.is_empty() {
+        let error = Error::Protocol("resume request was rejected".into());
+        fail_socket(&mut socket, "resume_rejected", &error).await;
+        return Err(error);
+    }
     let resume = open
         .resume
         .as_ref()

@@ -6,7 +6,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Du
 use acp_tunnel::{
     Error, Result,
     auth::StaticTokenAuthenticator,
-    client::{ConnectOptions, ShutdownHandle, connect_with_shutdown, shutdown_channel},
+    client::{
+        ConnectOptions, ShutdownHandle, connect_with_shutdown, select_client_environment,
+        shutdown_channel,
+    },
     config::ServerConfig,
     credentials::load_token,
     protocol::ShutdownReason,
@@ -67,6 +70,9 @@ enum Command {
         /// Read the bearer credential from this file.
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Send one named local variable when the selected agent allowlists it.
+        #[arg(long = "client-env", value_name = "NAME")]
+        client_env: Vec<String>,
     },
     /// Serve configured ACP agents over authenticated WebSockets.
     Serve {
@@ -127,8 +133,10 @@ async fn run() -> Result<()> {
             reconnect_timeout_seconds,
             shutdown_timeout_seconds,
             token_file,
+            client_env,
         } => {
             let token = load_token(token_file.as_deref())?;
+            let client_environment = select_client_environment(&client_env)?;
             let (shutdown_handle, shutdown_signal) = shutdown_channel();
             install_connector_signal_handler(shutdown_handle)?;
             connect_with_shutdown(
@@ -137,6 +145,7 @@ async fn run() -> Result<()> {
                     agent,
                     workspace,
                     token,
+                    client_environment,
                     max_frame_bytes,
                     max_replay_frames,
                     max_replay_bytes,
@@ -381,6 +390,21 @@ async fn run_test_agent(uncooperative: bool, spawn_grandchild: bool) -> Result<(
                         "jsonrpc":"2.0",
                         "id":id,
                         "result":{"pid":std::process::id()}
+                    }),
+                )
+                .await?;
+            }
+            Some("test/environment") => {
+                let name = request
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                write_json(
+                    &mut stdout,
+                    &json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "result":{"value":std::env::var(name).ok()}
                     }),
                 )
                 .await?;

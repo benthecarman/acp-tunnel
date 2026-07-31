@@ -12,7 +12,8 @@ use tokio::{
 
 use crate::{
     Error, Result,
-    config::{AgentConfig, McpServerConfig},
+    config::{AgentConfig, McpServerConfig, validate_environment_name},
+    protocol::ClientEnvironment,
 };
 
 /// The piped handles and identity of one running ACP agent.
@@ -30,7 +31,11 @@ pub struct AgentProcess {
 
 impl AgentProcess {
     /// Spawns one configured ACP agent without invoking a shell.
-    pub fn spawn(config: &AgentConfig, workspace: &Path) -> Result<Self> {
+    pub fn spawn(
+        config: &AgentConfig,
+        workspace: &Path,
+        client_environment: &ClientEnvironment,
+    ) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -39,7 +44,8 @@ impl AgentProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        apply_environment(&mut command, &config.pass_env, &config.env);
+        command.env_clear();
+        command.envs(merge_agent_environment(config, client_environment)?);
         configure_process_group(&mut command);
 
         let mut child = command.spawn().map_err(|error| {
@@ -232,13 +238,38 @@ pub fn selected_mcp_environment(config: &McpServerConfig) -> BTreeMap<String, St
     selected_environment(&config.pass_env, &config.env)
 }
 
-fn apply_environment(
-    command: &mut Command,
-    pass_env: &std::collections::BTreeSet<String>,
-    fixed: &BTreeMap<String, String>,
-) {
-    command.env_clear();
-    command.envs(selected_environment(pass_env, fixed));
+/// Merges server-owned agent environment with explicitly allowlisted client values.
+pub fn merge_agent_environment(
+    config: &AgentConfig,
+    client_environment: &ClientEnvironment,
+) -> Result<BTreeMap<String, String>> {
+    let mut merged = selected_environment(&config.pass_env, &config.env);
+    let mut incoming_names = std::collections::BTreeSet::new();
+    for variable in client_environment.variables() {
+        validate_environment_name("client agent", "request", variable.name()).map_err(|_| {
+            Error::Protocol("client environment has an invalid variable name".into())
+        })?;
+        if variable.value().contains('\0') {
+            return Err(Error::Protocol(
+                "client environment has an invalid variable value".into(),
+            ));
+        }
+        if !incoming_names.insert(variable.name()) {
+            return Err(Error::Protocol(
+                "client environment contains a duplicate variable name".into(),
+            ));
+        }
+        if !config.client_env_allowlist.contains(variable.name()) {
+            return Err(Error::Protocol(format!(
+                "client environment variable {:?} is not allowlisted for this agent",
+                variable.name()
+            )));
+        }
+        merged
+            .entry(variable.name().to_owned())
+            .or_insert_with(|| variable.value().to_owned());
+    }
+    Ok(merged)
 }
 
 #[cfg(unix)]
@@ -314,5 +345,109 @@ mod tests {
                 .keys()
                 .all(|key| pass_env.contains(key) || key == "NO_BROWSER")
         );
+    }
+
+    fn agent_config() -> AgentConfig {
+        AgentConfig {
+            command: "agent".into(),
+            args: Vec::new(),
+            workspaces: BTreeSet::new(),
+            pass_env: BTreeSet::new(),
+            env: BTreeMap::from([("SERVER_FIXED".into(), "server".into())]),
+            client_env_allowlist: BTreeSet::from(["CLIENT_VALUE".into(), "SERVER_FIXED".into()]),
+            mcp_policy: crate::config::McpPolicy::Deny,
+        }
+    }
+
+    #[test]
+    fn agent_environment_accepts_only_allowlisted_client_values() {
+        let config = agent_config();
+        let client = ClientEnvironment::new(vec![crate::protocol::ClientEnvironmentVariable::new(
+            "CLIENT_VALUE".into(),
+            "client".into(),
+        )]);
+        let merged = merge_agent_environment(&config, &client).unwrap();
+        assert_eq!(
+            merged.get("CLIENT_VALUE").map(String::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            merged.get("SERVER_FIXED").map(String::as_str),
+            Some("server")
+        );
+    }
+
+    #[test]
+    fn absent_client_agent_environment_preserves_server_environment() {
+        let config = agent_config();
+        let merged = merge_agent_environment(&config, &ClientEnvironment::default()).unwrap();
+        assert_eq!(
+            merged.get("SERVER_FIXED").map(String::as_str),
+            Some("server")
+        );
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn server_agent_environment_wins_client_collision() {
+        let config = agent_config();
+        let client = ClientEnvironment::new(vec![crate::protocol::ClientEnvironmentVariable::new(
+            "SERVER_FIXED".into(),
+            "client-secret".into(),
+        )]);
+        let merged = merge_agent_environment(&config, &client).unwrap();
+        assert_eq!(
+            merged.get("SERVER_FIXED").map(String::as_str),
+            Some("server")
+        );
+    }
+
+    #[test]
+    fn passed_server_agent_environment_wins_client_collision() {
+        let Some(server_path) = std::env::var("PATH").ok() else {
+            return;
+        };
+        let mut config = agent_config();
+        config.pass_env.insert("PATH".into());
+        config.client_env_allowlist.insert("PATH".into());
+        let client = ClientEnvironment::new(vec![crate::protocol::ClientEnvironmentVariable::new(
+            "PATH".into(),
+            "client-secret".into(),
+        )]);
+        let merged = merge_agent_environment(&config, &client).unwrap();
+        assert_eq!(merged.get("PATH"), Some(&server_path));
+    }
+
+    #[test]
+    fn agent_environment_rejects_unlisted_duplicate_and_malformed_entries() {
+        let config = agent_config();
+        let cases = [
+            ClientEnvironment::new(vec![crate::protocol::ClientEnvironmentVariable::new(
+                "UNLISTED".into(),
+                "secret-one".into(),
+            )]),
+            ClientEnvironment::new(vec![
+                crate::protocol::ClientEnvironmentVariable::new(
+                    "CLIENT_VALUE".into(),
+                    "secret-two".into(),
+                ),
+                crate::protocol::ClientEnvironmentVariable::new(
+                    "CLIENT_VALUE".into(),
+                    "secret-three".into(),
+                ),
+            ]),
+            ClientEnvironment::new(vec![crate::protocol::ClientEnvironmentVariable::new(
+                "BAD=NAME".into(),
+                "secret-four".into(),
+            )]),
+        ];
+        for client in cases {
+            let error = merge_agent_environment(&config, &client)
+                .unwrap_err()
+                .to_string();
+            for secret in ["secret-one", "secret-two", "secret-three", "secret-four"] {
+                assert!(!error.contains(secret));
+            }
+        }
     }
 }

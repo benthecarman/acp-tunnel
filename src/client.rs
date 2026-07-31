@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     io::BufRead,
     net::{IpAddr, ToSocketAddrs},
     time::Duration,
@@ -22,9 +22,12 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    config::validate_id,
+    config::{validate_environment_name, validate_id},
     credentials::SecretToken,
-    protocol::{AckStream, ClientInfo, Envelope, ResumeRequest, ShutdownReason, TUNNEL_VERSION},
+    protocol::{
+        AckStream, ClientEnvironment, ClientEnvironmentVariable, ClientInfo, Envelope,
+        ResumeRequest, ShutdownReason, TUNNEL_VERSION,
+    },
 };
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -40,6 +43,8 @@ pub struct ConnectOptions {
     pub workspace: String,
     /// Bearer credential loaded once during startup.
     pub token: SecretToken,
+    /// Explicit environment entries offered for initial agent creation.
+    pub client_environment: ClientEnvironment,
     /// Maximum ACP line and WebSocket message size.
     pub max_frame_bytes: usize,
     /// Maximum locally retained unacknowledged ACP frames.
@@ -129,11 +134,12 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
 
 /// Runs the connector with a reusable external shutdown signal.
 pub async fn connect_with_shutdown(
-    options: ConnectOptions,
+    mut options: ConnectOptions,
     mut shutdown: ShutdownSignal,
 ) -> Result<()> {
     validate_options(&options)?;
     let (mut socket, credentials) = open_socket(&options, None).await?;
+    options.client_environment.clear();
     let mut lines = spawn_stdin_reader()?;
     let mut stdout = BufWriter::new(tokio::io::stdout());
     let mut pending = VecDeque::<PendingFrame>::new();
@@ -400,6 +406,7 @@ fn validate_options(options: &ConnectOptions) -> Result<()> {
     validate_id("agent", &options.agent)?;
     validate_id("workspace", &options.workspace)?;
     validate_connect_url(&options.url)?;
+    validate_client_environment(&options.client_environment)?;
     if options.max_frame_bytes == 0
         || options.max_replay_frames == 0
         || options.max_replay_bytes < options.max_frame_bytes
@@ -411,6 +418,49 @@ fn validate_options(options: &ConnectOptions) -> Result<()> {
         return Err(Error::Config(
             "client frame, replay, and timeout settings are invalid".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Reads explicitly selected local environment variables once during startup.
+pub fn select_client_environment(names: &[String]) -> Result<ClientEnvironment> {
+    let mut selected = Vec::with_capacity(names.len());
+    let mut seen = BTreeSet::new();
+    for name in names {
+        validate_environment_name("connector", "client environment", name)?;
+        if !seen.insert(name.as_str()) {
+            return Err(Error::Config(format!(
+                "client environment variable {name:?} was selected more than once"
+            )));
+        }
+        let value = std::env::var(name).map_err(|error| match error {
+            std::env::VarError::NotPresent => Error::Config(format!(
+                "selected client environment variable {name:?} is not set"
+            )),
+            std::env::VarError::NotUnicode(_) => Error::Config(format!(
+                "selected client environment variable {name:?} is not valid UTF-8"
+            )),
+        })?;
+        selected.push(ClientEnvironmentVariable::new(name.clone(), value));
+    }
+    Ok(ClientEnvironment::new(selected))
+}
+
+fn validate_client_environment(environment: &ClientEnvironment) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for variable in environment.variables() {
+        validate_environment_name("connector", "client environment", variable.name())?;
+        if !seen.insert(variable.name()) {
+            return Err(Error::Config(format!(
+                "client environment variable {:?} was selected more than once",
+                variable.name()
+            )));
+        }
+        if variable.value().contains('\0') {
+            return Err(Error::Config(
+                "client environment contains an invalid variable value".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -452,6 +502,11 @@ async fn open_socket(
                 client_info: ClientInfo {
                     name: "acp-tunnel".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
+                },
+                client_environment: if resume.is_none() {
+                    options.client_environment.clone()
+                } else {
+                    ClientEnvironment::default()
                 },
                 resume: resume.map(|credentials| ResumeRequest {
                     connection_id: credentials.connection_id.clone(),
@@ -777,6 +832,10 @@ mod tests {
             agent: "fake".into(),
             workspace: "project".into(),
             token: SecretToken::new("connect-debug-secret".into()).unwrap(),
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "SESSION_CREDENTIAL".into(),
+                "environment-debug-secret".into(),
+            )]),
             max_frame_bytes: 1024,
             max_replay_frames: 8,
             max_replay_bytes: 8192,
@@ -787,7 +846,31 @@ mod tests {
         };
         let formatted = format!("{options:?}");
         assert!(!formatted.contains("connect-debug-secret"));
+        assert!(!formatted.contains("environment-debug-secret"));
         assert!(formatted.contains("REDACTED"));
+    }
+
+    #[test]
+    fn selected_client_environment_is_explicit_and_rejects_duplicates() {
+        let selected = select_client_environment(&["PATH".to_owned()]).unwrap();
+        assert_eq!(selected.variables().len(), 1);
+        assert_eq!(selected.variables()[0].name(), "PATH");
+
+        let duplicate = ClientEnvironment::new(vec![
+            ClientEnvironmentVariable::new("NAME".into(), "secret-one".into()),
+            ClientEnvironmentVariable::new("NAME".into(), "secret-two".into()),
+        ]);
+        let error = validate_client_environment(&duplicate)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret-one"));
+        assert!(!error.contains("secret-two"));
+
+        let missing =
+            select_client_environment(&["ACP_TUNNEL_TEST_MISSING_CLIENT_ENV_824D33".to_owned()])
+                .unwrap_err()
+                .to_string();
+        assert!(missing.contains("is not set"));
     }
 
     #[tokio::test]
@@ -798,7 +881,15 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut first = accept_async(stream).await.unwrap();
             let open = first.next().await.unwrap().unwrap();
-            assert!(matches!(open, Message::Text(_)));
+            let Message::Text(open) = open else {
+                panic!("expected initial open");
+            };
+            assert!(matches!(
+                Envelope::from_text(&open).unwrap(),
+                Envelope::Open { client_environment, resume: None, .. }
+                    if client_environment.variables().len() == 1
+                        && client_environment.variables()[0].name() == "SESSION_VALUE"
+            ));
             first
                 .send(Message::Text(
                     Envelope::Ready {
@@ -833,6 +924,7 @@ mod tests {
                 panic!("expected resume open");
             };
             let Envelope::Open {
+                client_environment,
                 resume: Some(resume),
                 ..
             } = Envelope::from_text(&open).unwrap()
@@ -841,6 +933,7 @@ mod tests {
             };
             assert_eq!(resume.connection_id, "connection");
             assert_eq!(resume.resume_token, "resume-secret");
+            assert!(client_environment.is_empty());
             resumed
                 .send(Message::Text(
                     Envelope::Ready {
@@ -873,6 +966,10 @@ mod tests {
             agent: "fake".into(),
             workspace: "project".into(),
             token: SecretToken::new("token".into()).unwrap(),
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "SESSION_VALUE".into(),
+                "secret".into(),
+            )]),
             max_frame_bytes: 1024,
             max_replay_frames: 8,
             max_replay_bytes: 8192,
@@ -979,6 +1076,7 @@ mod tests {
             agent: "fake".into(),
             workspace: "project".into(),
             token: SecretToken::new("token".into()).unwrap(),
+            client_environment: ClientEnvironment::default(),
             max_frame_bytes: 1024,
             max_replay_frames: 8,
             max_replay_bytes: 8192,

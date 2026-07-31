@@ -35,6 +35,7 @@ args = []
 workspaces = ["project-a"]
 pass_env = ["PATH", "HOME", "OPENAI_API_KEY"]
 env = { NO_BROWSER = "1" }
+client_env_allowlist = ["SESSION_ENDPOINT", "SESSION_ACCESS_TOKEN"]
 mcp_policy = "allowlisted"
 ```
 
@@ -47,6 +48,31 @@ When `command` is not absolute, include `PATH` in `pass_env`. Include platform
 variables such as `HOME` only when the configured agent needs them.
 
 Agent and workspace IDs match `[a-z0-9][a-z0-9_-]*`.
+
+### Client-selected agent environment
+
+Use `--client-env NAME` on the connector to select one local variable. Repeat
+the option to select more variables. The connector reads each selected value
+once during startup. A missing variable is an error.
+
+The agent `client_env_allowlist` controls the names that the server accepts.
+The server rejects unlisted, duplicate, and malformed names. The opening
+request does not accept commands, arguments, working directories, or other
+environment variables.
+
+The server constructs the agent environment in this order:
+
+1. It copies available host values selected by `pass_env`.
+2. It applies fixed server `env` values.
+3. It adds accepted client values.
+
+The first two server-owned sources take precedence over client values. The
+server uses client values only when it starts a new agent. Resume requests
+cannot add or change environment values.
+
+Each allowlisted name lets an authenticated and authorized client select its
+value for that agent process. Add a name only when this client control is
+acceptable. Environment values never occur in errors, logs, or Debug output.
 
 ## Workspaces
 
@@ -141,6 +167,10 @@ memory, compared in constant time, and never configured or logged. Set
 The connector uses `--shutdown-timeout-seconds 10` by default. During
 intentional shutdown, it waits for `shutdown_complete` for this duration. A
 timeout closes the transport and produces a nonzero exit.
+
+The connector sends client-selected agent environment only in the initial
+`open` message. Use `wss://` for all non-loopback connections. The server
+removes the retained values after it starts the agent.
 
 Set the server `shutdown_timeout_seconds` high enough for the agent and its
 process group. The server closes agent stdin before it sends SIGTERM. It sends

@@ -19,6 +19,7 @@ args = []
 workspaces = ["project-a", "project-b"]
 pass_env = ["PATH", "HOME", "OPENAI_API_KEY"]
 env = { NO_BROWSER = "1" }
+client_env_allowlist = ["SESSION_ENDPOINT", "SESSION_ACCESS_TOKEN"]
 mcp_policy = "allowlisted"
 
 [agents.claude]

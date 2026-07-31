@@ -102,6 +102,9 @@ pub struct AgentConfig {
     /// Fixed nonsecret environment values.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Client environment variable names accepted for this agent process.
+    #[serde(default)]
+    pub client_env_allowlist: BTreeSet<String>,
     /// Policy applied to client-provided MCP servers.
     #[serde(default)]
     pub mcp_policy: McpPolicy,
@@ -210,6 +213,9 @@ impl ServerConfig {
                 }
             }
             validate_environment("agent", id, &agent.pass_env, &agent.env)?;
+            for name in &agent.client_env_allowlist {
+                validate_environment_name("agent", id, name)?;
+            }
             if agent.mcp_policy == McpPolicy::Passthrough && !self.allow_insecure_mcp_passthrough {
                 return Err(Error::Config(format!(
                     "agent {id:?} uses MCP passthrough; set allow_insecure_mcp_passthrough = true to acknowledge remote command execution risk"
@@ -419,6 +425,19 @@ mod tests {
             r#"
             [mcp_servers.tools]
             command = "tools"
+            client_env_allowlist = ["VALID", "BAD=NAME"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn agent_client_environment_allowlist_uses_environment_name_validation() {
+        let config = parse(
+            r#"
+            [agents.test]
+            command = "agent"
             client_env_allowlist = ["VALID", "BAD=NAME"]
             "#,
         )

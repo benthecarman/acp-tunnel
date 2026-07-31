@@ -27,6 +27,76 @@ pub struct ResumeRequest {
     pub resume_token: String,
 }
 
+/// One explicitly selected client environment variable.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientEnvironmentVariable {
+    /// Environment variable name.
+    name: String,
+    /// Environment variable value. Debug output always redacts this field.
+    value: String,
+}
+
+impl ClientEnvironmentVariable {
+    /// Creates one client environment entry.
+    pub fn new(name: String, value: String) -> Self {
+        Self { name, value }
+    }
+
+    /// Returns the environment variable name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the environment variable value for validated process setup.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Debug for ClientEnvironmentVariable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientEnvironmentVariable")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Explicit client environment entries for a newly spawned remote agent.
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ClientEnvironment(Vec<ClientEnvironmentVariable>);
+
+impl ClientEnvironment {
+    /// Creates a client environment list.
+    pub fn new(variables: Vec<ClientEnvironmentVariable>) -> Self {
+        Self(variables)
+    }
+
+    /// Returns the selected entries.
+    pub fn variables(&self) -> &[ClientEnvironmentVariable] {
+        &self.0
+    }
+
+    /// Returns true when no client environment was selected.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Removes retained values after initial process creation.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl fmt::Debug for ClientEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(&self.0).finish()
+    }
+}
+
 impl fmt::Debug for ResumeRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -114,6 +184,9 @@ pub enum Envelope {
         workspace: String,
         /// Connecting client metadata.
         client_info: ClientInfo,
+        /// Explicit environment entries for a newly spawned agent.
+        #[serde(default, skip_serializing_if = "ClientEnvironment::is_empty")]
+        client_environment: ClientEnvironment,
         /// Resume credentials for a previously detached tunnel.
         #[serde(skip_serializing_if = "Option::is_none")]
         resume: Option<ResumeRequest>,
@@ -199,6 +272,7 @@ impl fmt::Debug for Envelope {
                 agent,
                 workspace,
                 client_info,
+                client_environment,
                 resume,
             } => formatter
                 .debug_struct("Open")
@@ -206,6 +280,7 @@ impl fmt::Debug for Envelope {
                 .field("agent", agent)
                 .field("workspace", workspace)
                 .field("client_info", client_info)
+                .field("client_environment", client_environment)
                 .field("resume", resume)
                 .finish(),
             Self::Ready {
@@ -284,12 +359,14 @@ impl Envelope {
                 agent,
                 workspace,
                 client_info,
+                client_environment,
                 resume,
             } if tunnel_version == TUNNEL_VERSION => Ok(OpenRequest {
                 tunnel_version,
                 agent,
                 workspace,
                 client_info,
+                client_environment,
                 resume,
             }),
             Self::Open { tunnel_version, .. } => Err(Error::Protocol(format!(
@@ -313,6 +390,8 @@ pub struct OpenRequest {
     pub workspace: String,
     /// Connecting client metadata.
     pub client_info: ClientInfo,
+    /// Explicit client environment entries for initial process creation.
+    pub client_environment: ClientEnvironment,
     /// Resume credentials, when reconnecting a v3 tunnel.
     pub resume: Option<ResumeRequest>,
 }
@@ -351,6 +430,7 @@ mod tests {
                 name: "test".into(),
                 version: "1".into(),
             },
+            client_environment: ClientEnvironment::default(),
             resume: None,
         };
         assert!(matches!(open.into_open(), Err(Error::Protocol(_))));
@@ -366,6 +446,7 @@ mod tests {
                 name: "test".into(),
                 version: "1".into(),
             },
+            client_environment: ClientEnvironment::default(),
             resume: None,
         };
         let error = open.into_open().unwrap_err().to_string();
@@ -410,6 +491,10 @@ mod tests {
                 name: "test".into(),
                 version: "1".into(),
             },
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "SESSION_CREDENTIAL".into(),
+                "environment-debug-secret".into(),
+            )]),
             resume: Some(ResumeRequest {
                 connection_id: "connection".into(),
                 resume_token: "resume-debug-secret".into(),
@@ -430,8 +515,42 @@ mod tests {
             "resume-debug-secret",
             "ready-debug-secret",
             "payload-debug-secret",
+            "environment-debug-secret",
         ] {
             assert!(!formatted.contains(secret));
         }
+    }
+
+    #[test]
+    fn open_round_trip_preserves_selected_environment() {
+        let open = Envelope::Open {
+            tunnel_version: TUNNEL_VERSION,
+            agent: "agent".into(),
+            workspace: "workspace".into(),
+            client_info: ClientInfo {
+                name: "test".into(),
+                version: "1".into(),
+            },
+            client_environment: ClientEnvironment::new(vec![ClientEnvironmentVariable::new(
+                "SESSION_ENDPOINT".into(),
+                "value".into(),
+            )]),
+            resume: None,
+        };
+        let text = open.to_text().unwrap();
+        assert!(text.contains("clientEnvironment"));
+        assert_eq!(Envelope::from_text(&text).unwrap(), open);
+
+        let absent = Envelope::from_text(
+            r#"{"type":"open","tunnelVersion":3,"agent":"agent","workspace":"workspace","clientInfo":{"name":"test","version":"1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            absent,
+            Envelope::Open {
+                client_environment,
+                ..
+            } if client_environment.is_empty()
+        ));
     }
 }

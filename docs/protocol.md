@@ -37,9 +37,27 @@ The first message on a new tunnel is:
   "clientInfo": {
     "name": "acp-tunnel",
     "version": "0.1.0"
-  }
+  },
+  "clientEnvironment": [
+    {
+      "name": "SESSION_ENDPOINT",
+      "value": "https://session.example"
+    },
+    {
+      "name": "SESSION_ACCESS_TOKEN",
+      "value": "connection-secret"
+    }
+  ]
 }
 ```
+
+`clientEnvironment` is optional. The connector includes only variables that
+the user selected with `--client-env`. The server accepts only names in the
+selected agent `client_env_allowlist`.
+
+The server rejects duplicate, malformed, and unlisted entries. Server
+`pass_env` and fixed `env` values take precedence. Errors, logs, and Debug
+output do not contain environment values.
 
 After validating the version and allowlisted identifiers and starting exactly
 one process, the server returns:
@@ -84,6 +102,9 @@ The server compares the resume token in constant time and verifies that the
 agent and workspace IDs match the original session. A successful reattachment
 returns the same connection ID and token with `"resumed": true`. A rejected or
 expired credential returns a generic `resume_rejected` error.
+
+A resume request must not contain `clientEnvironment`. The original agent
+keeps the environment that the server applied during process creation.
 
 Only one transport is active for a session. A newly authenticated transport
 replaces an older transport with the same resume capability.
@@ -208,6 +229,21 @@ Keepalive:
 
 The peer copies the nonce unchanged. Native WebSocket ping/pong frames can also
 be used by intermediaries.
+
+## Client-selected agent environment
+
+The connector reads selected local variables once during startup. It sends the
+selected names and values only in the first `open` message. TLS protects these
+values in transit on non-loopback connections.
+
+The server builds the process environment from three sources:
+
+1. The server selects host values through agent `pass_env`.
+2. The server applies fixed agent `env` values.
+3. The server adds allowlisted client values without replacing server values.
+
+The server clears the inherited process environment before it applies these
+sources. The client cannot supply a command, arguments, or a working directory.
 
 ## Limits and closure
 

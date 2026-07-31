@@ -37,6 +37,19 @@ value for that allowlisted MCP process. Server `pass_env` and fixed `env` values
 take precedence. The server rejects malformed or duplicate entries and removes
 all unlisted client environment variables.
 
+An agent `client_env_allowlist` grants the same narrow control for the remote
+agent process. The connector sends only names selected with `--client-env`.
+The server rejects unlisted, duplicate, and malformed entries. Server
+`pass_env` and fixed `env` values take precedence.
+
+An allowlisted agent environment name lets each authorized client select its
+value for one new remote process. Do not allowlist a name if that client
+control is not acceptable. Resume requests cannot change process environment.
+
+Client-selected values travel in the authenticated opening message. Use TLS
+for every non-loopback connection. Environment values have redacted Debug
+output and never occur in errors or logs.
+
 Reconnect uses a random, per-session resume capability in addition to the
 bearer token. Treat this capability as a secret. It is intentionally memory-only
 and expires when the session ends or its reconnect grace period elapses.
