@@ -1,11 +1,21 @@
-# Buzz custom harness
+# Use acp-tunnel with Buzz
 
-This guide connects Buzz on a client machine to an agent on the remote server.
+This guide configures `acp-tunnel` as a custom agent harness in Buzz Desktop.
+Buzz runs the connector locally. The selected ACP agent runs on the server.
+
+```text
+Buzz Desktop
+    → buzz-acp
+    → acp-tunnel connect on the Buzz machine
+    → acp-tunnel serve on the server
+    → configured remote ACP agent
+```
+
 Complete the [server setup](server-setup.md) before you configure Buzz.
 
-## Configure the server for Buzz
+## 1. Configure the server for Buzz
 
-The easiest method is the initializer preset:
+For a new server configuration, use the initializer preset:
 
 ```sh
 acp-tunnel init \
@@ -16,7 +26,10 @@ acp-tunnel init \
   --buzz
 ```
 
-For an existing configuration, add the Buzz names to the selected agent:
+The example uses `codex` as the public agent ID. The command and workspace must
+exist on the server.
+
+If the configuration already exists, add these names to the selected agent:
 
 ```toml
 [agents.codex]
@@ -27,26 +40,48 @@ client_env_allowlist = [
 ]
 ```
 
-Buzz selects the values for each new connection. The server accepts only the
-listed names. Server `pass_env` and fixed `env` values take precedence.
+Add this list to the agent section, not an MCP server section. Buzz selects the
+three values for each managed-agent connection.
 
-Restart the server after a configuration change:
+Make sure that the edited configuration is valid:
+
+```sh
+acp-tunnel check-config
+```
+
+Then restart the server:
 
 ```sh
 systemctl --user restart acp-tunnel.service
+systemctl --user status acp-tunnel.service
 ```
 
-## Prepare the client
+## 2. Prepare the Buzz machine
 
-Install `acp-tunnel` on the machine that runs Buzz. Then make sure that the
-command and token are available:
+Install the published connector on the machine that runs Buzz:
+
+```sh
+cargo install acp-tunnel --locked
+```
+
+Get its absolute path:
 
 ```sh
 command -v acp-tunnel
-test -r "$HOME/.config/acp-tunnel/token" && echo "token readable"
 ```
 
-If the token is absent, copy the same token from the server:
+The result usually resembles this path on Linux:
+
+```text
+/home/alice/.cargo/bin/acp-tunnel
+```
+
+You will enter the exact result in Buzz.
+
+### Install the tunnel token
+
+The Buzz machine and the server must use the same tunnel token. Copy the token
+through SSH or another approved secret-transfer system:
 
 ```sh
 install -d -m 0700 "$HOME/.config/acp-tunnel"
@@ -55,71 +90,163 @@ scp user@server.example:~/.config/acp-tunnel/token \
 chmod 0600 "$HOME/.config/acp-tunnel/token"
 ```
 
-Do not add the token to the Buzz configuration. The connector reads the
-default token file.
+Make sure that the token is readable:
 
-## Enter the custom-harness fields
-
-Create a custom harness in Buzz. Use the absolute path from
-`command -v acp-tunnel` as the executable.
-
-For example:
-
-```text
-Executable
-/home/ben/.cargo/bin/acp-tunnel
+```sh
+test -r "$HOME/.config/acp-tunnel/token" && echo "token readable"
 ```
 
-Add each command argument as a separate item, in this order:
+Do not paste the token into Buzz. Do not add `--token-file` unless you use a
+nondefault path.
 
-```text
-connect
---url
-wss://agents.example.com/v1/tunnel
---agent
-codex
---workspace
-project-a
---buzz
+### Examine the endpoint
+
+Run the unauthenticated endpoint diagnostic from the Buzz machine:
+
+```sh
+acp-tunnel doctor \
+  --url wss://agents.example.com/v1/tunnel
 ```
 
-Replace the URL, agent ID, and workspace ID with the server values. Do not put
-the complete command in the executable field.
+A successful public diagnostic receives `401 Unauthorized`. This response
+proves that the protected WebSocket route is reachable. It does not test the
+token.
 
-Do not add `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, or `BUZZ_AUTH_TAG` manually.
-Buzz supplies these values to the custom-harness process. The `--buzz` option
-selects their names for transport.
+## 3. Open the Buzz custom-harness form
 
-## Examine the connection
+You can open the form while you create an agent:
 
-Start a new Buzz session. The connector writes connection messages to stderr.
-It reserves stdout for ACP messages.
+1. Open **Agents**.
+2. Select **New agent**.
+3. Select **Create agent**.
+4. Open **Customize for this agent**.
+5. Open **Agent harness**.
+6. Select **Add custom harness…**.
 
-The following Buzz notice alone does not prove that the tunnel failed:
+You can also register the harness before you create an agent:
+
+1. Open **Settings**.
+2. Open **Agents**.
+3. Select **Add runtimes**.
+4. Select **Custom harness**.
+
+Both routes open the same form.
+
+## 4. Enter the harness definition
+
+Enter these values:
+
+| Buzz field | Value |
+|---|---|
+| **Name** | `ACP Tunnel` |
+| **ID** | `acp-tunnel` (Buzz derives this value from the name) |
+| **Command** | The absolute result from `command -v acp-tunnel` |
+| **Env vars** | Leave empty |
+| **Docs URL** | `https://github.com/benthecarman/acp-tunnel` (optional) |
+| **Install hint** | `cargo install acp-tunnel --locked` (optional) |
+
+Do not put the complete connector command in **Command**. This field contains
+only the executable path.
+
+Under **Arguments**, select **Add argument** eight times. Enter one value in
+each row, in this exact order:
+
+| Row | Value |
+|---:|---|
+| 1 | `connect` |
+| 2 | `--url` |
+| 3 | `wss://agents.example.com/v1/tunnel` |
+| 4 | `--agent` |
+| 5 | `codex` |
+| 6 | `--workspace` |
+| 7 | `project-a` |
+| 8 | `--buzz` |
+
+Replace row 3 with your tunnel URL. Replace rows 5 and 7 with the IDs from the
+server configuration.
+
+Leave **Env vars** empty. Buzz injects its managed session variables when it
+starts the connector.
+
+Select **Save**. If you opened the form from **Create agent**, Buzz selects the
+new harness automatically.
+
+If you registered the harness through **Settings**, select **ACP Tunnel** when
+you create or edit the agent.
+
+## 5. Start the Buzz agent
+
+Save the Buzz agent and start its managed harness. Buzz launches the connector
+with its relay URL, private key, and authorization tag.
+
+The `--buzz` option selects these exact names for the tunnel:
+
+```text
+BUZZ_RELAY_URL
+BUZZ_PRIVATE_KEY
+BUZZ_AUTH_TAG
+```
+
+The connector does not read other Buzz variables. The server accepts these
+values only because the selected agent allowlists their names.
+
+Do not run the `--buzz` connector command directly in a terminal. A terminal
+does not receive the managed session variables from Buzz.
+
+## Model selection notice
+
+Buzz can display this notice during agent setup:
 
 ```text
 Using built-in model options. Could not load live models for this provider.
 ```
 
-Live model discovery depends on the remote ACP agent. Start a session to
-examine the complete connection path.
+This notice does not mean that the tunnel failed. It means that live model
+discovery did not return a catalog that Buzz can use.
+
+Select a built-in model option and start the agent. Then use the first managed
+session to examine the complete tunnel path.
 
 ## Troubleshooting
 
-### Buzz reports a missing session variable
+### Buzz reports `Not found on PATH`
 
-Make sure that Buzz starts the connector as its custom harness. A terminal
-process does not receive the session variables that Buzz creates.
+Use the absolute result from `command -v acp-tunnel` in **Command**. Desktop
+applications often use a smaller `PATH` than terminal applications.
 
-Make sure that the command arguments include `--buzz`. Then make sure that the
-server agent allowlists all three Buzz names.
+### The Save button is disabled
 
-### The server rejects a client environment name
+Remove each empty argument or environment row. Buzz requires a value in every
+row that you add.
 
-Restart the server after you edit its configuration. Then make sure that Buzz
-uses the agent ID that contains the matching `client_env_allowlist`.
+### The connector rejects `--token-file`
 
-### The connector receives 401 Unauthorized
+The Buzz machine has an old `acp-tunnel` binary. Upgrade it and restart Buzz:
+
+```sh
+cargo install acp-tunnel --locked --force
+acp-tunnel --version
+```
+
+### The connector receives `401 Unauthorized`
 
 Make sure that the client and server use the same token. Then make sure that
 the TLS proxy forwards the `Authorization` header.
+
+### The remote agent reports a missing Buzz variable
+
+Make sure that row 8 contains `--buzz`. Then make sure that the selected server
+agent allowlists all three Buzz names.
+
+Restart `acp-tunnel serve` after you edit its configuration. Also restart the
+Buzz agent so that Buzz starts a new connector process.
+
+### The server rejects the agent or workspace
+
+Make sure that argument rows 5 and 7 match the server IDs. These values are
+identifiers, not filesystem paths or display names.
+
+### The public diagnostic returns `401 Unauthorized`
+
+This result is correct for `doctor --url`. The diagnostic intentionally sends
+no bearer token.
