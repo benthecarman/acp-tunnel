@@ -22,6 +22,9 @@ One binary provides:
 acp-tunnel connect
 acp-tunnel serve
 acp-tunnel check-config
+acp-tunnel init
+acp-tunnel doctor
+acp-tunnel service generate --user
 ```
 
 ACP messages are carried as complete NDJSON lines. Ordinary messages remain
@@ -42,6 +45,83 @@ Install stable Rust, then:
 cargo build --release
 install -m 0755 target/release/acp-tunnel ~/.local/bin/acp-tunnel
 ```
+
+### Guided server setup
+
+On the remote host, change to the workspace directory. Then start the
+initializer:
+
+```sh
+cd /srv/workspaces/project-a
+acp-tunnel init
+```
+
+The initializer prompts for the agent ID, executable, workspace, environment,
+and MCP policy. It creates these files:
+
+```text
+~/.config/acp-tunnel/config.toml
+~/.config/acp-tunnel/token
+```
+
+The token and configuration use private file permissions. The initializer
+refuses to replace an existing configuration unless you use `--force`.
+
+CAUTION: The initializer uses MCP passthrough by default. An authenticated
+client can supply commands for remote execution. Select `allowlisted` or `deny`
+during initialization when clients must not have this control.
+
+For a noninteractive Buzz setup, run:
+
+```sh
+acp-tunnel init \
+  --agent codex \
+  --agent-command codex-acp \
+  --workspace project-a \
+  --workspace-path /srv/workspaces/project-a \
+  --buzz
+```
+
+This command resolves the executable to an absolute path. It also allowlists
+the three fixed Buzz session variables for the agent.
+
+Run the local diagnostics:
+
+```sh
+acp-tunnel doctor \
+  --url wss://agents.example.com/v1/tunnel
+```
+
+The doctor examines the configuration, token, workspaces, executable, listener,
+and optional public address. It also examines the authentication response from
+the public WebSocket route. It reports MCP passthrough as a warning. It does not
+send a credential or start an agent.
+
+Start the server:
+
+```sh
+acp-tunnel serve
+```
+
+The `serve` and `check-config` commands read the default configuration file.
+Use `--config PATH` to select a different file.
+
+### systemd user service
+
+Generate a user-service unit from the installed executable:
+
+```sh
+install -d -m 0700 "$HOME/.config/systemd/user"
+acp-tunnel service generate --user \
+  > "$HOME/.config/systemd/user/acp-tunnel.service"
+systemctl --user daemon-reload
+systemctl --user enable --now acp-tunnel.service
+```
+
+The generated unit sends SIGTERM and waits 30 seconds before systemd can use
+SIGKILL. It runs `acp-tunnel serve` with the default configuration and token.
+
+### Manual server setup
 
 On the remote host, copy and edit
 [`examples/config.toml`](examples/config.toml), then validate it:
@@ -153,6 +233,11 @@ an opening request or starts a process. Both commands use `--token-file`,
 default file is `$HOME/.config/acp-tunnel/token`. Explicit sources take
 precedence. Tokens use a constant-time comparison. Tokens and authorization
 headers are never logged. The client does not follow redirects.
+
+The initializer writes MCP passthrough and its security acknowledgment by
+default. This policy permits authenticated clients to supply MCP commands. The
+`allowlisted` and `deny` policies keep client commands out of the remote
+process.
 
 Credential sources use this order:
 
@@ -289,6 +374,9 @@ service. Make sure that the proxy forwards `Authorization`.
 **Token file fails to load:** Make sure that the file is readable and 16 KiB or
 smaller. The default path is `$HOME/.config/acp-tunnel/token`. The file can end
 with one LF or CRLF.
+
+**Server setup is incomplete:** Run `acp-tunnel doctor`. Add `--url` to examine
+the public hostname, DNS result, TCP connection, and protected WebSocket route.
 
 **Unknown or missing workspace:** Check the requested ID, the agent's
 `workspaces` list, and the remote path. No files are copied by the tunnel.

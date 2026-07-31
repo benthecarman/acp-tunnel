@@ -70,6 +70,21 @@ not require group-readable secret mounts.
 The `--buzz` option selects three fixed environment names. It does not select a
 prefix. The agent `client_env_allowlist` remains authoritative for every name.
 
+The `init` command generates private configuration and token files. It refuses
+configuration symlinks and requires `--force` before replacement. It does not
+replace an existing token.
+
+The initializer selects MCP passthrough by default for compatibility. It writes
+`allow_insecure_mcp_passthrough = true` and prints a warning. This policy lets
+every authenticated and authorized tunnel client supply MCP commands for remote
+execution. Use `--mcp-policy allowlisted` or `--mcp-policy deny` for a narrower
+trust model.
+
+The `doctor` command reads configuration and credential sources. It does not
+print credentials, start an agent, or open an authenticated WebSocket. The
+public URL diagnostic sends an unauthenticated WebSocket request and expects
+HTTP 401.
+
 The token type has redacted `Debug` output. Authentication uses a constant-time
 comparison, and HTTP authorization headers are marked as sensitive.
 

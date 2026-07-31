@@ -1,7 +1,15 @@
 #![forbid(unsafe_code)]
 #![doc = "Command-line entry point for acp-tunnel."]
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io::{IsTerminal, Write as _},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
+};
 
 use acp_tunnel::{
     Error, Result,
@@ -10,12 +18,14 @@ use acp_tunnel::{
         ConnectOptions, ShutdownHandle, connect_with_shutdown, select_client_environment,
         shutdown_channel,
     },
-    config::ServerConfig,
+    config::{McpPolicy, ServerConfig},
     credentials::load_token,
+    paths::{default_token_file, resolve_server_config_file},
     protocol::ShutdownReason,
     server::{ServerState, serve},
+    setup::{DoctorLevel, InitOptions, diagnose_server, generate_user_service, initialize_server},
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio_util::sync::CancellationToken;
@@ -81,9 +91,9 @@ enum Command {
     },
     /// Serve configured ACP agents over authenticated WebSockets.
     Serve {
-        /// TOML server configuration.
+        /// Override the default server configuration file.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Override the configured listener address.
         #[arg(long)]
         listen: Option<SocketAddr>,
@@ -96,9 +106,59 @@ enum Command {
     },
     /// Parse and validate a server configuration without starting a server.
     CheckConfig {
-        /// TOML server configuration.
+        /// Override the default server configuration file.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+    },
+    /// Create a server configuration and bearer token.
+    Init {
+        /// Override the default server configuration file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the default bearer credential file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Public agent identifier.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Agent executable path or name.
+        #[arg(long = "agent-command")]
+        agent_command: Option<PathBuf>,
+        /// Public workspace identifier.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Existing remote workspace directory.
+        #[arg(long)]
+        workspace_path: Option<PathBuf>,
+        /// Inherit one server variable. Defaults to HOME and PATH.
+        #[arg(long = "pass-env", value_name = "NAME")]
+        pass_env: Vec<String>,
+        /// Accept the required Buzz session environment variables.
+        #[arg(long)]
+        buzz: bool,
+        /// MCP policy. Initialization defaults to passthrough.
+        #[arg(long, value_enum)]
+        mcp_policy: Option<InitMcpPolicy>,
+        /// Replace an existing server configuration file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Diagnose the local server configuration and network setup.
+    Doctor {
+        /// Override the default server configuration file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the default bearer credential file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Public tunnel URL to resolve and connect to.
+        #[arg(long)]
+        url: Option<Url>,
+    },
+    /// Generate service-manager configuration.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Internal infrastructure-free integration-test ACP agent.
     #[command(name = "__test-agent", hide = true)]
@@ -109,6 +169,33 @@ enum Command {
         /// Start an uncooperative process in the same process group.
         #[arg(long, hide = true)]
         spawn_grandchild: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitMcpPolicy {
+    Deny,
+    Allowlisted,
+    Passthrough,
+}
+
+impl From<InitMcpPolicy> for McpPolicy {
+    fn from(value: InitMcpPolicy) -> Self {
+        match value {
+            InitMcpPolicy::Deny => Self::Deny,
+            InitMcpPolicy::Allowlisted => Self::Allowlisted,
+            InitMcpPolicy::Passthrough => Self::Passthrough,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Write a systemd user-service unit to stdout.
+    Generate {
+        /// Generate a unit for the current user's service manager.
+        #[arg(long)]
+        user: bool,
     },
 }
 
@@ -174,6 +261,7 @@ async fn run() -> Result<()> {
             token_file,
         } => {
             init_server_logging()?;
+            let config = resolve_server_config_file(config)?;
             let mut config = ServerConfig::load(config)?;
             if let Some(listen) = listen {
                 config.listen = listen;
@@ -190,6 +278,7 @@ async fn run() -> Result<()> {
             serve(state, insecure_listen, shutdown).await
         }
         Command::CheckConfig { config } => {
+            let config = resolve_server_config_file(config)?;
             let loaded = ServerConfig::load(&config)?;
             println!(
                 "configuration is valid: {} agent(s), {} workspace(s), {} MCP server(s)",
@@ -199,11 +288,292 @@ async fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::Init {
+            config,
+            token_file,
+            agent,
+            agent_command,
+            workspace,
+            workspace_path,
+            pass_env,
+            buzz,
+            mcp_policy,
+            force,
+        } => run_init(InitCommandOptions {
+            config,
+            token_file,
+            agent,
+            agent_command,
+            workspace,
+            workspace_path,
+            pass_env,
+            buzz,
+            mcp_policy,
+            force,
+        }),
+        Command::Doctor {
+            config,
+            token_file,
+            url,
+        } => run_doctor(config, token_file, url.as_ref()).await,
+        Command::Service {
+            command: ServiceCommand::Generate { user },
+        } => {
+            if !user {
+                return Err(Error::Config(
+                    "service generation currently requires --user".into(),
+                ));
+            }
+            let executable = std::env::current_exe().map_err(|error| {
+                Error::Config(format!("cannot resolve the current executable: {error}"))
+            })?;
+            let service = generate_user_service(&executable)?;
+            print!("{service}");
+            eprintln!("acp-tunnel: save this unit as ~/.config/systemd/user/acp-tunnel.service");
+            Ok(())
+        }
         Command::TestAgent {
             uncooperative,
             spawn_grandchild,
         } => run_test_agent(uncooperative, spawn_grandchild).await,
     }
+}
+
+struct InitCommandOptions {
+    config: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    agent: Option<String>,
+    agent_command: Option<PathBuf>,
+    workspace: Option<String>,
+    workspace_path: Option<PathBuf>,
+    pass_env: Vec<String>,
+    buzz: bool,
+    mcp_policy: Option<InitMcpPolicy>,
+    force: bool,
+}
+
+fn run_init(options: InitCommandOptions) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal();
+    let config_path = resolve_server_config_file(options.config)?;
+    let token_path = options
+        .token_file
+        .or_else(default_token_file)
+        .ok_or_else(|| Error::Config("use --token-file because HOME is unavailable".into()))?;
+    let current_directory = std::env::current_dir()
+        .map_err(|error| Error::Config(format!("cannot read the current directory: {error}")))?;
+
+    let agent_id = required_value(options.agent, interactive, "Agent ID", Some("agent"))?;
+    let command = required_path(options.agent_command, interactive, "Agent command", None)?;
+    let workspace_id = required_value(
+        options.workspace,
+        interactive,
+        "Workspace ID",
+        default_workspace_id(&current_directory).as_deref(),
+    )?;
+    let workspace_path = required_path(
+        options.workspace_path,
+        interactive,
+        "Workspace path",
+        Some(&current_directory),
+    )?;
+    let pass_env = if options.pass_env.is_empty() {
+        if interactive {
+            parse_environment_names(&prompt("Inherited environment names", Some("HOME,PATH"))?)?
+        } else {
+            BTreeSet::from(["HOME".into(), "PATH".into()])
+        }
+    } else {
+        options.pass_env.into_iter().collect()
+    };
+    let buzz = if options.buzz || !interactive {
+        options.buzz
+    } else {
+        prompt_yes_no("Accept Buzz session variables", true)?
+    };
+    let client_env_allowlist = if buzz {
+        BUZZ_CLIENT_ENVIRONMENT.map(str::to_owned).into()
+    } else {
+        BTreeSet::new()
+    };
+    let mcp_policy = match options.mcp_policy {
+        Some(policy) => policy,
+        None if interactive => prompt_mcp_policy()?,
+        None => InitMcpPolicy::Passthrough,
+    };
+    if matches!(mcp_policy, InitMcpPolicy::Passthrough) {
+        eprintln!(
+            "acp-tunnel: WARNING: MCP passthrough permits authenticated clients to run remote commands"
+        );
+    }
+
+    let report = initialize_server(InitOptions {
+        config_path,
+        token_path,
+        agent_id: agent_id.clone(),
+        command,
+        workspace_id: workspace_id.clone(),
+        workspace_path,
+        pass_env,
+        client_env_allowlist,
+        mcp_policy: mcp_policy.into(),
+        force: options.force,
+    })?;
+    println!("Created configuration: {}", report.config_path.display());
+    if report.token_created {
+        println!("Created bearer token: {}", report.token_path.display());
+    } else {
+        println!(
+            "Using existing bearer token: {}",
+            report.token_path.display()
+        );
+    }
+    println!("Agent executable: {}", report.command.display());
+    println!("Workspace: {}", report.workspace_path.display());
+    println!("Run `acp-tunnel doctor`, then run `acp-tunnel serve`.");
+    println!("Configure the connector with --agent {agent_id} --workspace {workspace_id}.");
+    Ok(())
+}
+
+async fn run_doctor(
+    config: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    url: Option<&Url>,
+) -> Result<()> {
+    let config = resolve_server_config_file(config)?;
+    let mut report = diagnose_server(&config, token_file.as_deref(), url);
+    if let Some(url) = url {
+        report.append(acp_tunnel::setup::diagnose_websocket_endpoint(url).await);
+    }
+    for notice in &report.notices {
+        let level = match notice.level {
+            DoctorLevel::Ok => "ok",
+            DoctorLevel::Warning => "warning",
+            DoctorLevel::Error => "error",
+        };
+        println!("[{level}] {}", notice.message);
+    }
+    if report.has_errors() {
+        Err(Error::Config("doctor found one or more errors".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn required_value(
+    value: Option<String>,
+    interactive: bool,
+    label: &str,
+    default: Option<&str>,
+) -> Result<String> {
+    match value {
+        Some(value) => Ok(value),
+        None if interactive => prompt(label, default),
+        None => Err(Error::Config(format!(
+            "use --{} when stdin is not a terminal",
+            label.to_ascii_lowercase().replace(' ', "-")
+        ))),
+    }
+}
+
+fn required_path(
+    value: Option<PathBuf>,
+    interactive: bool,
+    label: &str,
+    default: Option<&Path>,
+) -> Result<PathBuf> {
+    match value {
+        Some(value) => Ok(value),
+        None if interactive => {
+            let default = default.map(|path| path.to_string_lossy().into_owned());
+            prompt(label, default.as_deref()).map(PathBuf::from)
+        }
+        None => Err(Error::Config(format!(
+            "use --{} when stdin is not a terminal",
+            label.to_ascii_lowercase().replace(' ', "-")
+        ))),
+    }
+}
+
+fn prompt(label: &str, default: Option<&str>) -> Result<String> {
+    match default {
+        Some(default) => print!("{label} [{default}]: "),
+        None => print!("{label}: "),
+    }
+    std::io::stdout()
+        .flush()
+        .map_err(|error| Error::Config(format!("cannot write prompt: {error}")))?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| Error::Config(format!("cannot read prompt response: {error}")))?;
+    let input = input.trim();
+    if input.is_empty() {
+        default.map(str::to_owned).ok_or_else(|| {
+            Error::Config(format!("{} must not be empty", label.to_ascii_lowercase()))
+        })
+    } else {
+        Ok(input.to_owned())
+    }
+}
+
+fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
+    let marker = if default { "Y/n" } else { "y/N" };
+    let answer = prompt(label, Some(marker))?;
+    if answer == marker {
+        return Ok(default);
+    }
+    match answer.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(Error::Config(format!(
+            "{label} requires a yes or no response"
+        ))),
+    }
+}
+
+fn prompt_mcp_policy() -> Result<InitMcpPolicy> {
+    let policy = prompt(
+        "MCP policy (passthrough, allowlisted, or deny)",
+        Some("passthrough"),
+    )?;
+    match policy.to_ascii_lowercase().as_str() {
+        "passthrough" => Ok(InitMcpPolicy::Passthrough),
+        "allowlisted" => Ok(InitMcpPolicy::Allowlisted),
+        "deny" => Ok(InitMcpPolicy::Deny),
+        _ => Err(Error::Config("unknown MCP policy".into())),
+    }
+}
+
+fn parse_environment_names(text: &str) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for name in text
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        acp_tunnel::config::validate_environment_name("generated agent", "environment", name)?;
+        names.insert(name.to_owned());
+    }
+    Ok(names)
+}
+
+fn default_workspace_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let mut id = String::new();
+    let mut separator = false;
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            id.push(character);
+            separator = false;
+        } else if !id.is_empty() && !separator {
+            id.push('-');
+            separator = true;
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    (!id.is_empty()).then_some(id)
 }
 
 #[cfg(unix)]

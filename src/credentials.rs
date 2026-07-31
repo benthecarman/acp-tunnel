@@ -10,7 +10,6 @@ use std::{
 use crate::{Error, Result};
 
 const MAX_TOKEN_FILE_BYTES: u64 = 16 * 1024;
-const DEFAULT_TOKEN_FILE: &str = ".config/acp-tunnel/token";
 
 /// A bearer token whose debug representation never reveals its value.
 #[derive(Clone, Eq, PartialEq)]
@@ -43,8 +42,13 @@ pub fn load_token(cli_token_file: Option<&Path>) -> Result<SecretToken> {
         cli_token_file.map(Path::to_path_buf),
         std::env::var_os("ACP_TUNNEL_TOKEN_FILE"),
         std::env::var_os("ACP_TUNNEL_TOKEN"),
-        default_token_file(),
+        crate::paths::default_token_file(),
     )
+}
+
+/// Loads one token file without consulting process environment variables.
+pub fn load_token_file(path: &Path) -> Result<SecretToken> {
+    read_token_file(path)
 }
 
 fn load_token_from_sources(
@@ -74,15 +78,6 @@ fn load_token_from_sources(
     Err(Error::Config(
         "set ACP_TUNNEL_TOKEN_FILE or ACP_TUNNEL_TOKEN, or use --token-file".into(),
     ))
-}
-
-fn default_token_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME");
-    #[cfg(windows)]
-    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
-    home.filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_TOKEN_FILE))
 }
 
 fn read_token_file(path: &Path) -> Result<SecretToken> {

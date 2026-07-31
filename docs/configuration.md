@@ -1,7 +1,37 @@
 # Configuration reference
 
-The server reads TOML. Run `acp-tunnel check-config --config PATH` before
-deployment. Unknown configuration keys are errors.
+The server reads `$HOME/.config/acp-tunnel/config.toml` by default. Use
+`--config PATH` to select a different file. Run `acp-tunnel check-config`
+before deployment. Unknown configuration keys are errors.
+
+## Generate a configuration
+
+Run `acp-tunnel init` for an interactive setup. The command creates a token and
+one agent with one workspace. It resolves the agent executable and makes the
+generated files private.
+
+The initializer uses these defaults:
+
+- Listener: `127.0.0.1:8787`
+- Inherited agent environment: `HOME` and `PATH`
+- MCP policy: `passthrough`
+- Configuration: `$HOME/.config/acp-tunnel/config.toml`
+- Token: `$HOME/.config/acp-tunnel/token`
+
+CAUTION: MCP passthrough lets an authenticated client supply remote commands.
+Use `--mcp-policy allowlisted` or `--mcp-policy deny` to prevent this control.
+
+Use `--buzz` to add the three fixed Buzz session names. The server still
+enforces `client_env_allowlist` for each opening request.
+
+The command refuses to replace an existing configuration. Use `--force` only
+when you intend to replace that exact file. The command refuses configuration
+symlinks, including with `--force`.
+
+Run `acp-tunnel doctor` after initialization. Use `--url` to examine the public
+URL scheme, DNS result, TCP connection, and WebSocket route. The route must
+reject the doctor's unauthenticated request. The doctor does not send a
+credential or start an agent.
 
 ## Top-level fields
 

@@ -12,6 +12,8 @@ pub mod config;
 pub mod credentials;
 /// Typed library errors.
 pub mod error;
+/// Per-user default paths.
+pub mod paths;
 /// Narrow ACP workspace and MCP policy transformations.
 pub mod policy;
 /// Remote agent process lifecycle.
@@ -20,5 +22,7 @@ pub mod process;
 pub mod protocol;
 /// Authenticated HTTP/WebSocket server.
 pub mod server;
+/// Server initialization, diagnostics, and service generation.
+pub mod setup;
 
 pub use error::{Error, Result};

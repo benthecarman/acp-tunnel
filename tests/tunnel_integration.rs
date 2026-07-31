@@ -718,6 +718,20 @@ async fn tunnel_protocol_version_two_is_rejected_clearly() {
 }
 
 #[tokio::test]
+async fn doctor_recognizes_the_authenticated_websocket_route() {
+    let server = TestServer::start().await;
+    let url = url::Url::parse(&format!("ws://{}/v1/tunnel", server.address)).unwrap();
+    let report = acp_tunnel::setup::diagnose_websocket_endpoint(&url).await;
+    assert!(!report.has_errors(), "{report:?}");
+    assert!(report.notices.iter().any(|notice| {
+        notice
+            .message
+            .contains("rejected an unauthenticated request")
+    }));
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn connect_command_uses_buzz_preset_and_default_token() {
     let server = TestServer::start().await;
     let client_home = tempfile::tempdir().unwrap();
