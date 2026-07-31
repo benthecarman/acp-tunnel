@@ -18,6 +18,10 @@ The initializer uses these defaults:
 - Configuration: `$HOME/.config/acp-tunnel/config.toml`
 - Token: `$HOME/.config/acp-tunnel/token`
 
+The configuration field defaults to `allowlisted` when `mcp_policy` is absent.
+The initializer explicitly writes `passthrough`. These defaults apply in
+different situations.
+
 CAUTION: MCP passthrough lets an authenticated client supply remote commands.
 Use `--mcp-policy allowlisted` or `--mcp-policy deny` to prevent this control.
 
@@ -168,13 +172,13 @@ behind a TLS reverse proxy. Plaintext on a non-loopback address requires
 
 ## Security-sensitive options
 
-`allowed_origins` should remain empty for non-browser ACP clients. If needed,
-entries are exact strings such as `https://trusted.example`; no wildcard or
-suffix matching occurs.
+Keep `allowed_origins` empty for non-browser ACP clients. If you need an entry,
+use an exact string such as `https://trusted.example`. Wildcard and suffix
+matching are not available.
 
 `allow_insecure_mcp_passthrough = true` only acknowledges the risk. An agent
 must also select `mcp_policy = "passthrough"`. Passthrough allows the client to
-provide commands and environment values that the remote agent may execute.
+provide commands and environment values that the remote agent can execute.
 
 The bearer token is not part of TOML. Both `connect` and `serve` use these
 credential sources, in this order:
@@ -182,11 +186,13 @@ credential sources, in this order:
 1. The CLI `--token-file` path.
 2. The `ACP_TUNNEL_TOKEN_FILE` path.
 3. The direct `ACP_TUNNEL_TOKEN` value.
+4. The `$HOME/.config/acp-tunnel/token` file.
 
-Do not provide a token file and `ACP_TUNNEL_TOKEN` together. The commands reject
-missing credentials and empty credentials. A token file must be 16 KiB or
-smaller. It can end with one LF or CRLF. Other spaces remain part of the token.
-Embedded newlines are invalid.
+Do not provide an explicit token-file source and `ACP_TUNNEL_TOKEN` together.
+The direct token takes precedence over the implicit default file. The commands
+reject missing credentials and empty credentials. A token file must be 16 KiB
+or smaller. It can end with one LF or CRLF. Other spaces remain part of the
+token. Embedded newlines are invalid.
 
 On Unix, the command warns when a token file is group-readable or
 world-readable. It does not reject the file because container secret mounts can

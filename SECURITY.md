@@ -6,15 +6,15 @@ Do not open a public issue for a suspected vulnerability. Use the repository's
 private vulnerability-reporting form under **Security → Advisories → Report a
 vulnerability**. Include:
 
-- the affected version or commit;
-- the deployment model and operating system;
-- reproduction steps or a minimal proof of concept;
-- the expected and observed security impact;
-- any suggested mitigation.
+- the affected version or commit
+- the deployment model and operating system
+- reproduction steps or a minimal proof of concept
+- the expected and observed security impact
+- any suggested mitigation
 
-You should receive an acknowledgement within three business days. Maintainers
-will coordinate validation, fixes, release timing, and disclosure. Please allow
-reasonable time for a patch before public disclosure.
+Maintainers acknowledge reports within three business days. They coordinate
+validation, fixes, release timing, and disclosure. Do not disclose the report
+before maintainers provide a patch timeline.
 
 ## Supported versions
 
@@ -74,11 +74,11 @@ The `init` command generates private configuration and token files. It refuses
 configuration symlinks and requires `--force` before replacement. It does not
 replace an existing token.
 
-The initializer selects MCP passthrough by default for compatibility. It writes
-`allow_insecure_mcp_passthrough = true` and prints a warning. This policy lets
-every authenticated and authorized tunnel client supply MCP commands for remote
-execution. Use `--mcp-policy allowlisted` or `--mcp-policy deny` for a narrower
-trust model.
+The initializer selects MCP passthrough by default for compatibility. The
+configuration field defaults to `allowlisted` when the field is absent. The
+initializer writes `allow_insecure_mcp_passthrough = true` and prints a warning.
+This policy lets authenticated clients supply remote MCP commands. Use
+`--mcp-policy allowlisted` or `--mcp-policy deny` for a narrower trust model.
 
 The `doctor` command reads configuration and credential sources. It does not
 print credentials, start an agent, or open an authenticated WebSocket. The
@@ -88,6 +88,6 @@ HTTP 401.
 The token type has redacted `Debug` output. Authentication uses a constant-time
 comparison, and HTTP authorization headers are marked as sensitive.
 
-Do not include bearer tokens, authorization headers, ACP payloads, prompts,
-environment values, private keys, or MCP secrets in reports sent through public
-channels.
+Do not include bearer tokens, authorization headers, ACP payloads, or prompts
+in public reports. Also exclude environment values, private keys, and MCP
+secrets.

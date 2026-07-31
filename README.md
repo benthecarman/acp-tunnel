@@ -39,14 +39,21 @@ This is not the official ACP remote HTTP transport.
 
 ## Quick start
 
-Install stable Rust, then:
+Install stable Rust on the server and the client. Run this command from the
+same `acp-tunnel` checkout on both machines:
 
 ```sh
-cargo build --release
-install -m 0755 target/release/acp-tunnel ~/.local/bin/acp-tunnel
+cargo install --path . --locked
 ```
 
-### Guided server setup
+Make sure that the installed command is available:
+
+```sh
+command -v acp-tunnel
+acp-tunnel --version
+```
+
+### 1. Configure the server
 
 On the remote host, change to the workspace directory. Then start the
 initializer:
@@ -67,9 +74,9 @@ and MCP policy. It creates these files:
 The token and configuration use private file permissions. The initializer
 refuses to replace an existing configuration unless you use `--force`.
 
-CAUTION: The initializer uses MCP passthrough by default. An authenticated
-client can supply commands for remote execution. Select `allowlisted` or `deny`
-during initialization when clients must not have this control.
+CAUTION: The initializer selects MCP passthrough for compatibility. An
+authenticated client can supply MCP commands for remote execution. Select
+`allowlisted` or `deny` if clients must not have this control.
 
 For a noninteractive Buzz setup, run:
 
@@ -85,30 +92,18 @@ acp-tunnel init \
 This command resolves the executable to an absolute path. It also allowlists
 the three fixed Buzz session variables for the agent.
 
-Run the local diagnostics:
+Run the server diagnostics before you start the listener:
 
 ```sh
-acp-tunnel doctor \
-  --url wss://agents.example.com/v1/tunnel
+acp-tunnel doctor
 ```
 
-The doctor examines the configuration, token, workspaces, executable, listener,
-and optional public address. It also examines the authentication response from
-the public WebSocket route. It reports MCP passthrough as a warning. It does not
-send a credential or start an agent.
+The listener check reports that the address is available. This result is
+expected before the service starts.
 
-Start the server:
+### 2. Start the server service
 
-```sh
-acp-tunnel serve
-```
-
-The `serve` and `check-config` commands read the default configuration file.
-Use `--config PATH` to select a different file.
-
-### systemd user service
-
-Generate a user-service unit from the installed executable:
+Generate and start a systemd user service:
 
 ```sh
 install -d -m 0700 "$HOME/.config/systemd/user"
@@ -118,64 +113,87 @@ systemctl --user daemon-reload
 systemctl --user enable --now acp-tunnel.service
 ```
 
+Do not also run `acp-tunnel serve` in a terminal. Both processes use the same
+listener address.
+
+For a headless server, keep the user service active after logout:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
 The generated unit sends SIGTERM and waits 30 seconds before systemd can use
-SIGKILL. It runs `acp-tunnel serve` with the default configuration and token.
+SIGKILL. Read the complete [server setup guide](docs/server-setup.md) for
+foreground tests, system services, and diagnostic results.
 
-### Manual server setup
+### 3. Add a secure WebSocket endpoint
 
-On the remote host, copy and edit
-[`examples/config.toml`](examples/config.toml), then validate it:
+The server listens on `127.0.0.1:8787` by default. Add a TLS reverse proxy
+before you connect from another machine.
 
-```sh
-acp-tunnel check-config --config /etc/acp-tunnel/config.toml
-```
+For a private tailnet endpoint, use the
+[Tailscale Serve guide](docs/tailscale.md). For a conventional reverse proxy,
+use the [Nginx example](examples/nginx.conf).
 
-Start a loopback server behind a TLS reverse proxy:
+### 4. Copy the token to the client
 
-```sh
-acp-tunnel serve \
-  --token-file /run/secrets/acp-tunnel-token \
-  --listen 127.0.0.1:8787 \
-  --config /etc/acp-tunnel/config.toml
-```
-
-Configure the local ACP client to launch one of these commands as its agent:
-
-```sh
-# Claude ACP
-ACP_TUNNEL_TOKEN='the-same-token' \
-  acp-tunnel connect \
-  --url wss://agents.example.com/v1/tunnel \
-  --agent claude \
-  --workspace project-a
-
-# Codex ACP
-ACP_TUNNEL_TOKEN='the-same-token' \
-  acp-tunnel connect \
-  --url wss://agents.example.com/v1/tunnel \
-  --agent codex \
-  --workspace project-a
-
-# Goose
-ACP_TUNNEL_TOKEN='the-same-token' \
-  acp-tunnel connect \
-  --url wss://agents.example.com/v1/tunnel \
-  --agent goose \
-  --workspace project-a
-```
-
-The connector reads `$HOME/.config/acp-tunnel/token` by default. Protect this
-file so that only your account can read it:
+The client and server must use the same token. On the client, copy the token
+through SSH or another approved secret-transfer system:
 
 ```sh
 install -d -m 0700 "$HOME/.config/acp-tunnel"
-install -m 0600 /secure/path/acp-tunnel-token \
+scp user@server.example:~/.config/acp-tunnel/token \
   "$HOME/.config/acp-tunnel/token"
+chmod 0600 "$HOME/.config/acp-tunnel/token"
+```
 
+Do not paste the token into the ACP client configuration. The connector reads
+`$HOME/.config/acp-tunnel/token` by default.
+
+### 5. Examine the public endpoint
+
+Run this command on the client:
+
+```sh
+acp-tunnel doctor --url wss://agents.example.com/v1/tunnel
+```
+
+The public test does not send the token. A successful test receives
+`401 Unauthorized`. This response proves that DNS, TLS, routing, and
+authentication enforcement work. It does not prove that authenticated
+requests work.
+
+### 6. Configure the ACP client
+
+Configure the local ACP client to run this command as its agent:
+
+```sh
 acp-tunnel connect \
   --url wss://agents.example.com/v1/tunnel \
   --agent codex \
   --workspace project-a
+```
+
+For Buzz, add `--buzz` and use the exact field layout in the
+[Buzz custom-harness guide](docs/buzz.md).
+
+The connector writes only ACP messages to stdout. It writes connection status,
+remote stderr, and errors to stderr.
+
+## Manual server command
+
+The `serve` and `check-config` commands read the default configuration file.
+Use `--config PATH` to select a different file.
+
+To use explicit paths, first edit the
+[example configuration](examples/config.toml). Then run these commands:
+
+```sh
+acp-tunnel check-config --config /etc/acp-tunnel/config.toml
+acp-tunnel serve \
+  --token-file /run/secrets/acp-tunnel-token \
+  --listen 127.0.0.1:8787 \
+  --config /etc/acp-tunnel/config.toml
 ```
 
 Some agents need values that the local ACP client selects for each connection.
@@ -195,49 +213,11 @@ SESSION_ACCESS_TOKEN=connection-secret \
 The selected agent configuration must list the same names in
 `client_env_allowlist`. The connector does not send other local variables.
 
-### Buzz preset
-
-Buzz supplies three session variables to its custom harness. Use `--buzz` to
-select these exact names:
-
-```sh
-acp-tunnel connect \
-  --url wss://agents.example.com/v1/tunnel \
-  --agent codex \
-  --workspace project-a \
-  --buzz
-```
-
-The preset selects `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, and `BUZZ_AUTH_TAG`.
-The server agent must allowlist these names. The command fails if Buzz does not
-supply one of these variables. You can add other names with `--client-env`.
-
-```toml
-[agents.codex]
-client_env_allowlist = [
-  "BUZZ_RELAY_URL",
-  "BUZZ_PRIVATE_KEY",
-  "BUZZ_AUTH_TAG",
-]
-```
-
-The tunnel protocol and server policy remain generic. The `--buzz` option is a
-client-side shortcut for the three names. It does not change their values or
-bypass the server allowlist.
-
 ## Security model
 
 The server authenticates the HTTP upgrade with a bearer token before it accepts
-an opening request or starts a process. Both commands use `--token-file`,
-`ACP_TUNNEL_TOKEN_FILE`, `ACP_TUNNEL_TOKEN`, or the default token file. The
-default file is `$HOME/.config/acp-tunnel/token`. Explicit sources take
-precedence. Tokens use a constant-time comparison. Tokens and authorization
-headers are never logged. The client does not follow redirects.
-
-The initializer writes MCP passthrough and its security acknowledgment by
-default. This policy permits authenticated clients to supply MCP commands. The
-`allowlisted` and `deny` policies keep client commands out of the remote
-process.
+an opening request or starts a process. Tokens use a constant-time comparison.
+Tokens and authorization headers are never logged.
 
 Credential sources use this order:
 
@@ -249,31 +229,9 @@ Credential sources use this order:
 The loader rejects an explicit token file with `ACP_TUNNEL_TOKEN`. The direct
 token takes precedence over the implicit default file.
 
-The client supplies an agent ID and workspace ID. It can also offer variables
-that the connector selects with `--client-env`. The server owns every
-executable, argument, environment rule, and filesystem path. It clears the
-agent environment and copies only server-approved names. It invokes the
-executable directly without a shell.
-
-Agent `pass_env` and fixed `env` values take precedence over client values. An
-agent `client_env_allowlist` grants connection-specific control to authorized
-clients. The server rejects unlisted, duplicate, and malformed entries. It
-does not log environment values.
-
-Browser `Origin` headers are rejected unless their exact value appears in
-`allowed_origins`. Plaintext servers are restricted to loopback unless
-`--insecure-listen` is explicitly supplied. A client requires `wss://` except
-for loopback destinations.
-
-The connector uses an explicit shutdown exchange for stdin EOF, SIGTERM,
-SIGINT, Ctrl-C, and library shutdown requests. The server first closes the
-agent stdin. It then escalates to SIGTERM and SIGKILL when the agent does not
-exit. The connector waits for confirmation and sends a normal WebSocket close
-frame.
-
-On an unexpected network loss, the server keeps the complete agent process
-group alive for `reconnect_grace_seconds`. The authenticated connector resumes
-the same process and replays only unacknowledged ACP frames.
+The server owns agent commands, arguments, environment rules, and filesystem
+paths. It clears the agent environment and copies only approved names. It never
+runs an agent command through a shell.
 
 ```text
 explicit shutdown
@@ -290,12 +248,15 @@ The remote host is part of the trusted computing base. It sees ACP traffic,
 prompts, workspace files, agent credentials, and tool activity. Protect the
 host, configuration, token, TLS keys, logs, and reverse proxy accordingly.
 
-See [SECURITY.md](SECURITY.md) and the configuration
-[security notes](docs/configuration.md#security-sensitive-options).
+Read [SECURITY.md](SECURITY.md) and the configuration
+[security notes](docs/configuration.md#security-sensitive-options) for the
+complete trust model.
 
 ## MCP policy
 
-Each agent selects one server-owned policy:
+Each agent selects one server-owned policy. If `mcp_policy` is absent, the
+configuration field defaults to `allowlisted`. The initializer explicitly
+writes `passthrough` for compatibility.
 
 - `deny` replaces `params.mcpServers` with an empty array.
 - `allowlisted` (default) matches each incoming `name` against `[mcp_servers]`
@@ -306,11 +267,11 @@ Each agent selects one server-owned policy:
 Unknown allowlist names produce a JSON-RPC error with the original request ID.
 Server `pass_env` and fixed `env` values override client values. An allowlisted
 name lets any authenticated and authorized tunnel client select its value for
-that allowlisted MCP process. Do not allowlist a name unless this control is
-acceptable.
-`passthrough` permits remote command execution and is unsafe for untrusted
-clients. It requires `allow_insecure_mcp_passthrough = true` and emits a startup
-warning.
+that allowlisted MCP process.
+
+CAUTION: `passthrough` permits remote command execution. Use it only for trusted
+clients. Read the [MCP configuration](docs/configuration.md#mcp-servers) before
+you select or define an allowlist.
 
 ## Workspace mapping
 
@@ -324,47 +285,31 @@ already exist at the configured remote path.
 
 ## Reliability and privacy
 
-The default ACP line and WebSocket message limit is 10 MiB. Bounded channels and
-bounded line codecs apply backpressure. Each direction assigns sequence numbers
-and acknowledges a frame only after flushing it to the next local pipe. During
-reconnect, unacknowledged frames are replayed and duplicates are acknowledged
-without being delivered twice. Replay storage is bounded by
-`max_replay_frames` and `max_replay_bytes`.
-
-Tunnel ping/pong messages detect dead peers. Agent stderr uses a bounded,
-nonblocking path: when the diagnostic queue is full or the tunnel is detached,
-stderr lines are dropped and the dropped count is logged at connection close.
-ACP traffic is retained or backpressured instead.
-
-Server logs include connection, agent, workspace, process, exit, frame, byte,
-and error-category fields. They never include ACP payloads, prompts, token
-values, authorization headers, or environment values.
-
 Reconnect state is memory-only. It survives transient WebSocket and proxy
 failures while both `acp-tunnel` processes remain alive, but it does not survive
-a connector or server process restart.
+a connector or server process restart. Replay storage, messages, lines, and
+channels have configured limits.
 
-The connector waits 10 seconds for `shutdown_complete` by default. Set
-`--shutdown-timeout-seconds` to change this limit. If the timeout expires, the
-connector closes the transport and exits nonzero. It does not resume normal
-reconnect attempts.
+Logs never include ACP payloads, prompts, token values, authorization headers,
+or environment values. Read the [protocol guide](docs/protocol.md) for replay,
+shutdown, message limits, and diagnostic behavior.
 
 ## TLS and reverse proxies
 
 For direct TLS, set `[tls].cert_path` and `[tls].key_path`. For a reverse proxy,
 bind plain HTTP to loopback and terminate TLS at the proxy. The proxy must:
 
-- use HTTP/1.1 to the upstream;
-- forward WebSocket `Upgrade` and `Connection` headers;
-- forward `Authorization` unchanged;
-- disable response buffering;
-- use an idle timeout longer than `keepalive_timeout_seconds`.
+- use HTTP/1.1 to the upstream
+- forward WebSocket `Upgrade` and `Connection` headers
+- forward `Authorization` unchanged
+- disable response buffering
+- use an idle timeout longer than `keepalive_timeout_seconds`
 
 See [`examples/nginx.conf`](examples/nginx.conf).
 
 ## Troubleshooting
 
-**ACP client reports malformed JSON:** Verify that only remote ACP lines reach
+**ACP client reports malformed JSON:** Make sure that only remote ACP lines reach
 local stdout. Put client diagnostics and wrapper output on stderr. Do not add
 shell startup messages around `acp-tunnel connect`.
 
@@ -378,16 +323,20 @@ with one LF or CRLF.
 **Server setup is incomplete:** Run `acp-tunnel doctor`. Add `--url` to examine
 the public hostname, DNS result, TCP connection, and protected WebSocket route.
 
-**Unknown or missing workspace:** Check the requested ID, the agent's
-`workspaces` list, and the remote path. No files are copied by the tunnel.
+**Unknown or missing workspace:** Make sure that the requested ID matches the
+configuration. Make sure that the agent lists the workspace. Make sure that the
+remote path exists. No files are copied by the tunnel.
 
-**Agent fails to start:** Confirm `command` resolves under the configured
-`pass_env` policy, the binary is executable, and the service user can enter the
-workspace. Include `PATH` in `pass_env` when using an executable name.
+**Agent fails to start:** Make sure that `command` resolves under the configured
+`pass_env` policy. Make sure that the binary is executable. Make sure that the
+service user can enter the workspace. Include `PATH` in `pass_env` when you use
+an executable name.
 
-**MCP policy rejection:** Add the incoming MCP `name` under `[mcp_servers]`,
-choose `deny`, or use the explicitly insecure passthrough mode only for trusted
-clients.
+**MCP policy rejection:** Select one response:
+
+- Add the incoming MCP `name` under `[mcp_servers]`.
+- Select `deny` to disable client MCP servers.
+- Select passthrough only for trusted clients.
 
 **Client environment rejection:** Add the selected name to the agent
 `client_env_allowlist`. Remove the corresponding `--client-env` option if the
@@ -397,9 +346,9 @@ remote agent does not need the variable.
 custom harness. The preset fails when its process environment lacks a required
 Buzz variable.
 
-**Proxy closes long sessions:** The connector should report a successful
-reconnect on stderr. Raise proxy read/send timeouts above the server keepalive
-timeout, confirm WebSocket upgrades are forwarded, and ensure the connector's
+**Proxy closes long sessions:** The connector reports a successful reconnect on
+stderr. Increase the proxy timeouts above the server keepalive timeout. Make
+sure that the proxy forwards WebSocket upgrades. Make sure that the connector
 reconnect timeout does not exceed the server grace period.
 
 **A supervisor leaves a remote agent running:** Configure the supervisor to
@@ -414,6 +363,10 @@ final cleanup fallback after a failed cleanup resume.
 
 - [Tunnel protocol](docs/protocol.md)
 - [Configuration reference](docs/configuration.md)
+- [Server setup](docs/server-setup.md)
+- [Buzz custom harness](docs/buzz.md)
+- [Tailscale Serve](docs/tailscale.md)
+- [Upgrade both endpoints](docs/upgrading.md)
 - [Docker Compose deployment](docs/docker-compose.md)
 - [Example configuration](examples/config.toml)
 - [systemd service](examples/acp-tunnel.service)

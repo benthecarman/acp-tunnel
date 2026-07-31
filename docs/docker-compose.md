@@ -80,6 +80,10 @@ mcp_policy = "allowlisted"
 path = "/srv/workspaces/project-a"
 ```
 
+This guide selects `allowlisted` deliberately. The container procedure does
+not use `acp-tunnel init`, which generates a passthrough configuration by
+default.
+
 Change the agent ID, command, and environment names for your agent image. Keep
 all commands, arguments, and environment rules in this server-owned file.
 
@@ -233,6 +237,17 @@ acp-tunnel connect \
 
 This command reads `$HOME/.config/acp-tunnel/token` by default. Use
 `--token-file` or `ACP_TUNNEL_TOKEN_FILE` for a different path.
+
+Copy the same token from `deploy/acp-tunnel-token` to the client through an
+approved secret-transfer system. Install it with private permissions:
+
+```sh
+install -d -m 0700 "$HOME/.config/acp-tunnel"
+install -m 0600 /secure/path/acp-tunnel-token \
+  "$HOME/.config/acp-tunnel/token"
+```
+
+Do not put the token value in the ACP client configuration.
 
 The local connector writes only ACP messages to stdout. It writes connection
 status, remote stderr, and errors to stderr.
