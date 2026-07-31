@@ -71,7 +71,13 @@ impl TestServer {
             args = ["__test-agent"]
             workspaces = ["project"]
             env = {{ SERVER_FIXED = "server-owned" }}
-            client_env_allowlist = ["SESSION_CREDENTIAL", "SERVER_FIXED"]
+            client_env_allowlist = [
+                "SESSION_CREDENTIAL",
+                "SERVER_FIXED",
+                "BUZZ_RELAY_URL",
+                "BUZZ_PRIVATE_KEY",
+                "BUZZ_AUTH_TAG",
+            ]
             mcp_policy = "deny"
 
             [workspaces.project]
@@ -712,8 +718,12 @@ async fn tunnel_protocol_version_two_is_rejected_clearly() {
 }
 
 #[tokio::test]
-async fn connect_command_keeps_stdout_protocol_pure() {
+async fn connect_command_uses_buzz_preset_and_default_token() {
     let server = TestServer::start().await;
+    let client_home = tempfile::tempdir().unwrap();
+    let token_directory = client_home.path().join(".config/acp-tunnel");
+    std::fs::create_dir_all(&token_directory).unwrap();
+    std::fs::write(token_directory.join("token"), b"integration-secret\n").unwrap();
     let executable = std::env::var("CARGO_BIN_EXE_acp-tunnel")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_acp-tunnel").to_owned());
     let mut child = Command::new(executable)
@@ -725,13 +735,16 @@ async fn connect_command_keeps_stdout_protocol_pure() {
             "fake",
             "--workspace",
             "project",
-            "--client-env",
-            "SESSION_CREDENTIAL",
+            "--buzz",
             "--shutdown-timeout-seconds",
             "3",
         ])
-        .env("ACP_TUNNEL_TOKEN", "integration-secret")
-        .env("SESSION_CREDENTIAL", "cli-selected-secret")
+        .env_remove("ACP_TUNNEL_TOKEN")
+        .env_remove("ACP_TUNNEL_TOKEN_FILE")
+        .env("HOME", client_home.path())
+        .env("BUZZ_RELAY_URL", "wss://relay.example")
+        .env("BUZZ_PRIVATE_KEY", "cli-selected-secret")
+        .env("BUZZ_AUTH_TAG", "integration-auth")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -742,7 +755,9 @@ async fn connect_command_keeps_stdout_protocol_pure() {
     stdin
         .write_all(
             br#"{"jsonrpc":"2.0","id":"client-init","method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":"client-environment","method":"test/environment","params":{"name":"SESSION_CREDENTIAL"}}
+{"jsonrpc":"2.0","id":"buzz-relay","method":"test/environment","params":{"name":"BUZZ_RELAY_URL"}}
+{"jsonrpc":"2.0","id":"buzz-key","method":"test/environment","params":{"name":"BUZZ_PRIVATE_KEY"}}
+{"jsonrpc":"2.0","id":"buzz-auth","method":"test/environment","params":{"name":"BUZZ_AUTH_TAG"}}
 "#,
         )
         .await
@@ -759,17 +774,20 @@ async fn connect_command_keeps_stdout_protocol_pure() {
         message["result"]["agentInfo"]["name"],
         "acp-tunnel-test-agent"
     );
-    line.clear();
-    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
-    let environment: Value = serde_json::from_str(line.trim_end()).unwrap();
-    assert_eq!(environment["id"], "client-environment");
-    assert_eq!(
-        environment["result"]["value"],
-        Value::String("cli-selected-secret".into())
-    );
+    for (id, expected) in [
+        ("buzz-relay", "wss://relay.example"),
+        ("buzz-key", "cli-selected-secret"),
+        ("buzz-auth", "integration-auth"),
+    ] {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let environment: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(environment["id"], id);
+        assert_eq!(environment["result"]["value"], expected);
+    }
     stdin.shutdown().await.unwrap();
     drop(stdin);
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())

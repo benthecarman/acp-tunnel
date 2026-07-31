@@ -84,15 +84,18 @@ ACP_TUNNEL_TOKEN='the-same-token' \
   --workspace project-a
 ```
 
-For applications that cannot safely set a token environment variable, use a
-token file:
+The connector reads `$HOME/.config/acp-tunnel/token` by default. Protect this
+file so that only your account can read it:
 
 ```sh
-ACP_TUNNEL_TOKEN_FILE="$HOME/.config/acp-tunnel/token" \
-  acp-tunnel connect \
-    --url wss://agents.example.com/v1/tunnel \
-    --agent codex \
-    --workspace project-a
+install -d -m 0700 "$HOME/.config/acp-tunnel"
+install -m 0600 /secure/path/acp-tunnel-token \
+  "$HOME/.config/acp-tunnel/token"
+
+acp-tunnel connect \
+  --url wss://agents.example.com/v1/tunnel \
+  --agent codex \
+  --workspace project-a
 ```
 
 Some agents need values that the local ACP client selects for each connection.
@@ -112,17 +115,54 @@ SESSION_ACCESS_TOKEN=connection-secret \
 The selected agent configuration must list the same names in
 `client_env_allowlist`. The connector does not send other local variables.
 
-There is no vendor-specific code. The names select server configuration only.
-Any ACP client that can launch a command can use the same executable, arguments,
-and environment.
+### Buzz preset
+
+Buzz supplies three session variables to its custom harness. Use `--buzz` to
+select these exact names:
+
+```sh
+acp-tunnel connect \
+  --url wss://agents.example.com/v1/tunnel \
+  --agent codex \
+  --workspace project-a \
+  --buzz
+```
+
+The preset selects `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, and `BUZZ_AUTH_TAG`.
+The server agent must allowlist these names. The command fails if Buzz does not
+supply one of these variables. You can add other names with `--client-env`.
+
+```toml
+[agents.codex]
+client_env_allowlist = [
+  "BUZZ_RELAY_URL",
+  "BUZZ_PRIVATE_KEY",
+  "BUZZ_AUTH_TAG",
+]
+```
+
+The tunnel protocol and server policy remain generic. The `--buzz` option is a
+client-side shortcut for the three names. It does not change their values or
+bypass the server allowlist.
 
 ## Security model
 
 The server authenticates the HTTP upgrade with a bearer token before it accepts
 an opening request or starts a process. Both commands use `--token-file`,
-`ACP_TUNNEL_TOKEN_FILE`, or `ACP_TUNNEL_TOKEN`. Tokens are compared in a
-constant-time padded loop. Tokens and authorization headers are never logged.
-The client does not follow redirects.
+`ACP_TUNNEL_TOKEN_FILE`, `ACP_TUNNEL_TOKEN`, or the default token file. The
+default file is `$HOME/.config/acp-tunnel/token`. Explicit sources take
+precedence. Tokens use a constant-time comparison. Tokens and authorization
+headers are never logged. The client does not follow redirects.
+
+Credential sources use this order:
+
+1. `--token-file`
+2. `ACP_TUNNEL_TOKEN_FILE`
+3. `ACP_TUNNEL_TOKEN`
+4. `$HOME/.config/acp-tunnel/token`
+
+The loader rejects an explicit token file with `ACP_TUNNEL_TOKEN`. The direct
+token takes precedence over the implicit default file.
 
 The client supplies an agent ID and workspace ID. It can also offer variables
 that the connector selects with `--client-env`. The server owns every
@@ -246,8 +286,9 @@ shell startup messages around `acp-tunnel connect`.
 **401 Unauthorized:** Load the same nonempty token in the connector and remote
 service. Make sure that the proxy forwards `Authorization`.
 
-**Token file fails to load:** Make sure that the path is readable and the file
-is 16 KiB or smaller. The file can end with one LF or CRLF.
+**Token file fails to load:** Make sure that the file is readable and 16 KiB or
+smaller. The default path is `$HOME/.config/acp-tunnel/token`. The file can end
+with one LF or CRLF.
 
 **Unknown or missing workspace:** Check the requested ID, the agent's
 `workspaces` list, and the remote path. No files are copied by the tunnel.
@@ -263,6 +304,10 @@ clients.
 **Client environment rejection:** Add the selected name to the agent
 `client_env_allowlist`. Remove the corresponding `--client-env` option if the
 remote agent does not need the variable.
+
+**The Buzz preset reports a missing variable:** Start the connector as the Buzz
+custom harness. The preset fails when its process environment lacks a required
+Buzz variable.
 
 **Proxy closes long sessions:** The connector should report a successful
 reconnect on stderr. Raise proxy read/send timeouts above the server keepalive

@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+const BUZZ_CLIENT_ENVIRONMENT: [&str; 3] = ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG"];
+
 #[derive(Debug, Parser)]
 #[command(
     name = "acp-tunnel",
@@ -67,12 +69,15 @@ enum Command {
         /// Maximum time to wait for remote shutdown confirmation.
         #[arg(long, default_value_t = 10)]
         shutdown_timeout_seconds: u64,
-        /// Read the bearer credential from this file.
+        /// Override the default bearer credential file.
         #[arg(long)]
         token_file: Option<PathBuf>,
         /// Send one named local variable when the selected agent allowlists it.
         #[arg(long = "client-env", value_name = "NAME")]
         client_env: Vec<String>,
+        /// Send the required Buzz session environment variables.
+        #[arg(long)]
+        buzz: bool,
     },
     /// Serve configured ACP agents over authenticated WebSockets.
     Serve {
@@ -85,7 +90,7 @@ enum Command {
         /// Permit plaintext HTTP on a non-loopback listener.
         #[arg(long)]
         insecure_listen: bool,
-        /// Read the bearer credential from this file.
+        /// Override the default bearer credential file.
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
@@ -133,9 +138,13 @@ async fn run() -> Result<()> {
             reconnect_timeout_seconds,
             shutdown_timeout_seconds,
             token_file,
-            client_env,
+            mut client_env,
+            buzz,
         } => {
             let token = load_token(token_file.as_deref())?;
+            if buzz {
+                client_env.extend(BUZZ_CLIENT_ENVIRONMENT.map(str::to_owned));
+            }
             let client_environment = select_client_environment(&client_env)?;
             let (shutdown_handle, shutdown_signal) = shutdown_channel();
             install_connector_signal_handler(shutdown_handle)?;

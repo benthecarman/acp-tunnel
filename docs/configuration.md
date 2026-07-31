@@ -55,6 +55,11 @@ Use `--client-env NAME` on the connector to select one local variable. Repeat
 the option to select more variables. The connector reads each selected value
 once during startup. A missing variable is an error.
 
+For a Buzz custom harness, `--buzz` selects `BUZZ_RELAY_URL`,
+`BUZZ_PRIVATE_KEY`, and `BUZZ_AUTH_TAG`. The preset is equivalent to three
+`--client-env` options. It does not select variables by prefix. The server
+agent must allowlist all three names.
+
 The agent `client_env_allowlist` controls the names that the server accepts.
 The server rejects unlisted, duplicate, and malformed names. The opening
 request does not accept commands, arguments, working directories, or other

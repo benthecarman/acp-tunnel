@@ -225,12 +225,14 @@ Install `acp-tunnel` on the client host or in the ACP client container. Configur
 the ACP client to run:
 
 ```sh
-ACP_TUNNEL_TOKEN_FILE="$HOME/.config/acp-tunnel/token" \
-  acp-tunnel connect \
+acp-tunnel connect \
   --url wss://agents.example.com/v1/tunnel \
   --agent codex \
   --workspace project-a
 ```
+
+This command reads `$HOME/.config/acp-tunnel/token` by default. Use
+`--token-file` or `ACP_TUNNEL_TOKEN_FILE` for a different path.
 
 The local connector writes only ACP messages to stdout. It writes connection
 status, remote stderr, and errors to stderr.

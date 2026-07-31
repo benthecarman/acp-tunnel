@@ -10,6 +10,7 @@ use std::{
 use crate::{Error, Result};
 
 const MAX_TOKEN_FILE_BYTES: u64 = 16 * 1024;
+const DEFAULT_TOKEN_FILE: &str = ".config/acp-tunnel/token";
 
 /// A bearer token whose debug representation never reveals its value.
 #[derive(Clone, Eq, PartialEq)]
@@ -36,12 +37,13 @@ impl fmt::Debug for SecretToken {
     }
 }
 
-/// Loads one tunnel credential from the CLI path or process environment.
+/// Loads one tunnel credential from an explicit source or the default file.
 pub fn load_token(cli_token_file: Option<&Path>) -> Result<SecretToken> {
     load_token_from_sources(
         cli_token_file.map(Path::to_path_buf),
         std::env::var_os("ACP_TUNNEL_TOKEN_FILE"),
         std::env::var_os("ACP_TUNNEL_TOKEN"),
+        default_token_file(),
     )
 }
 
@@ -49,6 +51,7 @@ fn load_token_from_sources(
     cli_token_file: Option<PathBuf>,
     environment_token_file: Option<OsString>,
     direct_token: Option<OsString>,
+    default_token_file: Option<PathBuf>,
 ) -> Result<SecretToken> {
     let token_file = cli_token_file.or_else(|| environment_token_file.map(PathBuf::from));
     if token_file.is_some() && direct_token.is_some() {
@@ -59,13 +62,27 @@ fn load_token_from_sources(
     if let Some(path) = token_file {
         return read_token_file(&path);
     }
-    let token = direct_token.ok_or_else(|| {
-        Error::Config("set ACP_TUNNEL_TOKEN_FILE or ACP_TUNNEL_TOKEN, or use --token-file".into())
-    })?;
-    let token = token
-        .into_string()
-        .map_err(|_| Error::Config("ACP_TUNNEL_TOKEN must contain valid Unicode text".into()))?;
-    validate_token_text(token)
+    if let Some(token) = direct_token {
+        let token = token.into_string().map_err(|_| {
+            Error::Config("ACP_TUNNEL_TOKEN must contain valid Unicode text".into())
+        })?;
+        return validate_token_text(token);
+    }
+    if let Some(path) = default_token_file {
+        return read_token_file(&path);
+    }
+    Err(Error::Config(
+        "set ACP_TUNNEL_TOKEN_FILE or ACP_TUNNEL_TOKEN, or use --token-file".into(),
+    ))
+}
+
+fn default_token_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    home.filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(DEFAULT_TOKEN_FILE))
 }
 
 fn read_token_file(path: &Path) -> Result<SecretToken> {
@@ -144,7 +161,8 @@ mod tests {
 
     #[test]
     fn direct_environment_token_is_loaded() {
-        let token = load_token_from_sources(None, None, Some(OsString::from("direct"))).unwrap();
+        let token =
+            load_token_from_sources(None, None, Some(OsString::from("direct")), None).unwrap();
         assert_eq!(token.expose(), "direct");
     }
 
@@ -156,6 +174,7 @@ mod tests {
             Some(cli.path().to_path_buf()),
             Some(environment.path().as_os_str().to_owned()),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(token.expose(), "cli");
@@ -165,7 +184,8 @@ mod tests {
     fn environment_token_file_is_loaded() {
         let file = file_with(b"file-token");
         let token =
-            load_token_from_sources(None, Some(file.path().as_os_str().to_owned()), None).unwrap();
+            load_token_from_sources(None, Some(file.path().as_os_str().to_owned()), None, None)
+                .unwrap();
         assert_eq!(token.expose(), "file-token");
     }
 
@@ -176,6 +196,7 @@ mod tests {
             Some(file.path().to_path_buf()),
             None,
             Some(OsString::from("direct-secret")),
+            None,
         )
         .unwrap_err();
         assert!(!error.to_string().contains("direct-secret"));
@@ -183,10 +204,12 @@ mod tests {
 
     #[test]
     fn missing_and_empty_tokens_are_rejected() {
-        assert!(load_token_from_sources(None, None, None).is_err());
-        assert!(load_token_from_sources(None, None, Some(OsString::new())).is_err());
+        assert!(load_token_from_sources(None, None, None, None).is_err());
+        assert!(load_token_from_sources(None, None, Some(OsString::new()), None).is_err());
         let file = file_with(b"\n");
-        assert!(load_token_from_sources(Some(file.path().to_path_buf()), None, None).is_err());
+        assert!(
+            load_token_from_sources(Some(file.path().to_path_buf()), None, None, None).is_err()
+        );
     }
 
     #[test]
@@ -194,7 +217,7 @@ mod tests {
         for contents in [b"secret\n".as_slice(), b"secret\r\n".as_slice()] {
             let file = file_with(contents);
             let token =
-                load_token_from_sources(Some(file.path().to_path_buf()), None, None).unwrap();
+                load_token_from_sources(Some(file.path().to_path_buf()), None, None, None).unwrap();
             assert_eq!(token.expose(), "secret");
         }
     }
@@ -202,7 +225,8 @@ mod tests {
     #[test]
     fn spaces_are_preserved() {
         let file = file_with(b"  secret value  \n");
-        let token = load_token_from_sources(Some(file.path().to_path_buf()), None, None).unwrap();
+        let token =
+            load_token_from_sources(Some(file.path().to_path_buf()), None, None, None).unwrap();
         assert_eq!(token.expose(), "  secret value  ");
     }
 
@@ -210,7 +234,7 @@ mod tests {
     fn embedded_newlines_are_rejected_without_disclosing_the_token() {
         let file = file_with(b"first-secret\nsecond-secret\n");
         let error =
-            load_token_from_sources(Some(file.path().to_path_buf()), None, None).unwrap_err();
+            load_token_from_sources(Some(file.path().to_path_buf()), None, None, None).unwrap_err();
         let formatted = error.to_string();
         assert!(!formatted.contains("first-secret"));
         assert!(!formatted.contains("second-secret"));
@@ -219,7 +243,26 @@ mod tests {
     #[test]
     fn oversized_file_is_rejected() {
         let file = file_with(&vec![b'x'; (MAX_TOKEN_FILE_BYTES + 1) as usize]);
-        assert!(load_token_from_sources(Some(file.path().to_path_buf()), None, None).is_err());
+        assert!(
+            load_token_from_sources(Some(file.path().to_path_buf()), None, None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn default_token_file_is_the_last_fallback() {
+        let file = file_with(b"default-token\n");
+        let token =
+            load_token_from_sources(None, None, None, Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(token.expose(), "default-token");
+
+        let direct = load_token_from_sources(
+            None,
+            None,
+            Some(OsString::from("direct-token")),
+            Some(file.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(direct.expose(), "direct-token");
     }
 
     #[test]

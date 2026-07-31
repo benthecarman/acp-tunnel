@@ -61,10 +61,14 @@ period. A WebSocket close without a `shutdown` envelope is unexpected.
 Supervisors must close connector stdin or send SIGTERM before SIGKILL. SIGKILL
 cannot be caught, so it cannot request immediate remote cleanup.
 
-Load the bearer token from `--token-file`, `ACP_TUNNEL_TOKEN_FILE`, or
-`ACP_TUNNEL_TOKEN`. A file keeps the token out of process environment listings
-and application configuration. Restrict the file permissions when the runtime
-does not require group-readable secret mounts.
+Load the bearer token from `--token-file`, `ACP_TUNNEL_TOKEN_FILE`,
+`ACP_TUNNEL_TOKEN`, or `$HOME/.config/acp-tunnel/token`. The default file is the
+last fallback. A file keeps the token out of process environment listings and
+application configuration. Restrict the file permissions when the runtime does
+not require group-readable secret mounts.
+
+The `--buzz` option selects three fixed environment names. It does not select a
+prefix. The agent `client_env_allowlist` remains authoritative for every name.
 
 The token type has redacted `Debug` output. Authentication uses a constant-time
 comparison, and HTTP authorization headers are marked as sensitive.
