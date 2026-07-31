@@ -46,3 +46,4 @@ path = "/srv/workspaces/project-b"
 command = "/usr/local/bin/developer-mcp"
 args = []
 pass_env = ["API_TOKEN"]
+client_env_allowlist = ["PROJECT_URL", "PROJECT_TOKEN"]

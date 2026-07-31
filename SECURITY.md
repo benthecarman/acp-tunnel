@@ -31,6 +31,12 @@ and secret isolation as additional controls.
 MCP `passthrough` mode allows client-controlled remote command execution. It is
 not suitable for untrusted clients.
 
+In `allowlisted` MCP mode, `client_env_allowlist` grants narrow client control.
+Each listed name lets any authenticated and authorized tunnel client select the
+value for that allowlisted MCP process. Server `pass_env` and fixed `env` values
+take precedence. The server rejects malformed or duplicate entries and removes
+all unlisted client environment variables.
+
 Reconnect uses a random, per-session resume capability in addition to the
 bearer token. Treat this capability as a secret. It is intentionally memory-only
 and expires when the session ends or its reconnect grace period elapses.

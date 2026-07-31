@@ -130,6 +130,9 @@ pub struct McpServerConfig {
     /// Fixed nonsecret environment values.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Client environment variable names accepted for this MCP process.
+    #[serde(default)]
+    pub client_env_allowlist: BTreeSet<String>,
 }
 
 /// Policy for MCP server configuration inside `session/new`.
@@ -218,6 +221,9 @@ impl ServerConfig {
             validate_id("MCP server", id)?;
             validate_command("MCP server", id, &server.command)?;
             validate_environment("MCP server", id, &server.pass_env, &server.env)?;
+            for name in &server.client_env_allowlist {
+                validate_environment_name("MCP server", id, name)?;
+            }
         }
 
         for origin in &self.allowed_origins {
@@ -297,11 +303,7 @@ fn validate_environment(
     env: &BTreeMap<String, String>,
 ) -> Result<()> {
     for name in pass_env.iter().chain(env.keys()) {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
-            return Err(Error::Config(format!(
-                "{kind} {id:?} has invalid environment variable name"
-            )));
-        }
+        validate_environment_name(kind, id, name)?;
     }
     let overlap: Vec<_> = pass_env
         .iter()
@@ -313,6 +315,17 @@ fn validate_environment(
         Err(Error::Config(format!(
             "{kind} {id:?} lists the same variable in pass_env and env"
         )))
+    }
+}
+
+/// Validates one environment variable name without disclosing a value.
+pub fn validate_environment_name(kind: &str, id: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('=') || name.contains('\0') {
+        Err(Error::Config(format!(
+            "{kind} {id:?} has invalid environment variable name"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -394,6 +407,19 @@ mod tests {
             [agents.test]
             command = "agent"
             mcp_policy = "passthrough"
+            "#,
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn client_environment_allowlist_uses_environment_name_validation() {
+        let config = parse(
+            r#"
+            [mcp_servers.tools]
+            command = "tools"
+            client_env_allowlist = ["VALID", "BAD=NAME"]
             "#,
         )
         .unwrap();

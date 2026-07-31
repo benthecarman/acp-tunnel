@@ -64,15 +64,33 @@ or synchronize the directory.
 ```toml
 [mcp_servers.developer-tools]
 command = "/usr/local/bin/developer-mcp"
-args = []
-pass_env = ["API_TOKEN"]
+args = ["serve"]
+pass_env = ["PATH"]
 env = { LOG_FORMAT = "json" }
+client_env_allowlist = [
+  "PROJECT_URL",
+  "PROJECT_TOKEN",
+  "AGENT_DISPLAY_NAME",
+]
 ```
 
 In `allowlisted` mode, the incoming MCP `name` selects this table entry. All
-incoming executable, argument, path, and environment fields are discarded.
-`pass_env` values are copied by the server into ACP's `{name,value}` environment
-array. These values are sensitive and are never logged.
+incoming executable, argument, and path fields are discarded. The server parses
+the incoming environment as an ACP object or a `{name,value}` array.
+
+The server constructs the MCP environment in this order:
+
+1. It copies available host values selected by `pass_env`.
+2. It applies fixed server `env` values.
+3. It adds client values whose names occur in `client_env_allowlist`.
+
+The first two server-owned sources take precedence over client values. The
+server rejects duplicate client names and malformed entries. It does not copy
+unlisted names. Environment values never occur in errors or logs.
+
+An allowlisted name lets any authenticated and authorized tunnel client select
+its value for that allowlisted MCP process. Add a name only when every client
+that can select the agent and workspace can also select this value.
 
 ## Direct TLS
 

@@ -138,10 +138,15 @@ Each agent selects one server-owned policy:
 
 - `deny` replaces `params.mcpServers` with an empty array.
 - `allowlisted` (default) matches each incoming `name` against `[mcp_servers]`
-  and replaces all client command, argument, and environment data.
+  and replaces client command and argument data. It keeps only client
+  environment names in the server `client_env_allowlist`.
 - `passthrough` forwards client MCP definitions unchanged.
 
 Unknown allowlist names produce a JSON-RPC error with the original request ID.
+Server `pass_env` and fixed `env` values override client values. An allowlisted
+name lets any authenticated and authorized tunnel client select its value for
+that allowlisted MCP process. Do not allowlist a name unless this control is
+acceptable.
 `passthrough` permits remote command execution and is unsafe for untrusted
 clients. It requires `allow_insecure_mcp_passthrough = true` and emits a startup
 warning.
