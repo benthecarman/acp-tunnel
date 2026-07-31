@@ -43,7 +43,7 @@ use crate::{
     credentials::SecretToken,
     policy::{AcpPolicy, PolicyOutcome},
     process::{AgentProcess, exit_details},
-    protocol::{AckStream, Envelope, OpenRequest, TUNNEL_VERSION},
+    protocol::{AckStream, Envelope, OpenRequest, ShutdownReason, TUNNEL_VERSION},
 };
 
 /// Shared server state used by HTTP handlers and tunnel tasks.
@@ -175,6 +175,10 @@ enum TransportCommand {
         envelope: Envelope,
         sent: oneshot::Sender<()>,
     },
+    ShutdownComplete {
+        envelope: Envelope,
+        sent: oneshot::Sender<()>,
+    },
 }
 
 struct TransportEvent {
@@ -187,7 +191,7 @@ enum TransportEventKind {
     Activity,
     Writable,
     Disconnected,
-    Closed { intentional: bool },
+    Closed,
     InvalidEnvelope,
 }
 
@@ -406,7 +410,7 @@ async fn run_agent_session(
     open: OpenRequest,
 ) -> Result<()> {
     let pid = process.pid;
-    let mut stdin = BufWriter::new(process.take_stdin()?);
+    let mut stdin = Some(BufWriter::new(process.take_stdin()?));
     let stdout = process.take_stdout()?;
     let stderr = process.take_stderr()?;
     let counters = Arc::new(Counters::default());
@@ -456,6 +460,7 @@ async fn run_agent_session(
     let mut child_status = None::<ExitStatus>;
     let mut resumed_count = 0_u64;
     let mut exit_was_sent = false;
+    let mut shutdown_reason = None::<ShutdownReason>;
     let mut keepalive = tokio::time::interval(state.config.keepalive_interval());
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -597,7 +602,9 @@ async fn run_agent_session(
                         handle_client_envelope(
                             envelope,
                             &policy,
-                            &mut stdin,
+                            stdin.as_mut().ok_or_else(|| {
+                                Error::Process("agent stdin closed before session ended".into())
+                            })?,
                             transport.as_ref(),
                             &mut pending,
                             &mut pending_bytes,
@@ -606,7 +613,12 @@ async fn run_agent_session(
                             &counters,
                             &state.config,
                             &mut end_category,
+                            &mut shutdown_reason,
                         ).await?;
+                        if shutdown_reason.is_some() {
+                            state.sessions.lock().await.remove(connection_id);
+                            end_category = Some("client_shutdown".into());
+                        }
                     }
                     TransportEventKind::Activity => {
                         last_received = Instant::now();
@@ -626,16 +638,12 @@ async fn run_agent_session(
                             "tunnel transport detached; awaiting reconnect"
                         );
                     }
-                    TransportEventKind::Closed { intentional } => {
-                        if intentional {
-                            end_category = Some("client_close".into());
-                        } else {
-                            detach_transport(
-                                &mut transport,
-                                &mut detached_deadline,
-                                state.config.reconnect_grace(),
-                            );
-                        }
+                    TransportEventKind::Closed => {
+                        detach_transport(
+                            &mut transport,
+                            &mut detached_deadline,
+                            state.config.reconnect_grace(),
+                        );
                     }
                     TransportEventKind::InvalidEnvelope => {
                         end_category = Some("invalid_envelope".into());
@@ -674,7 +682,23 @@ async fn run_agent_session(
         }
     }
 
-    if child_status.is_none() {
+    if end_category.as_deref() == Some("client_shutdown") {
+        if let Some(mut agent_stdin) = stdin.take() {
+            let _ = agent_stdin.flush().await;
+            let _ = agent_stdin.shutdown().await;
+            drop(agent_stdin);
+        }
+        if child_status.is_none() {
+            child_status = Some(
+                process
+                    .graceful_shutdown_and_reap(
+                        state.config.shutdown_timeout(),
+                        state.config.shutdown_timeout(),
+                    )
+                    .await?,
+            );
+        }
+    } else if child_status.is_none() {
         child_status = Some(
             process
                 .terminate_and_reap(state.config.shutdown_timeout())
@@ -686,7 +710,11 @@ async fn run_agent_session(
     let (code, signal) = exit_details(&status);
     let end_category = end_category.unwrap_or_else(|| "unknown".into());
 
-    if let Some(current) = transport.as_ref()
+    if end_category == "client_shutdown" {
+        if let Some(current) = transport.as_ref() {
+            let _ = send_shutdown_complete(current, &status, state.config.shutdown_timeout()).await;
+        }
+    } else if let Some(current) = transport.as_ref()
         && !exit_was_sent
         && !matches!(end_category.as_str(), "client_close" | "reconnect_timeout")
     {
@@ -725,8 +753,7 @@ async fn run_agent_session(
         "tunnel closed"
     );
 
-    if (end_category == "child_exit" && status.success()) || end_category.as_str() == "client_close"
-    {
+    if (end_category == "child_exit" && status.success()) || end_category == "client_shutdown" {
         Ok(())
     } else {
         Err(match end_category.as_str() {
@@ -750,6 +777,7 @@ async fn handle_client_envelope(
     counters: &Counters,
     config: &ServerConfig,
     end_category: &mut Option<String>,
+    shutdown_reason: &mut Option<ShutdownReason>,
 ) -> Result<()> {
     match envelope {
         Envelope::Acp {
@@ -824,6 +852,11 @@ async fn handle_client_envelope(
             }
         }
         Envelope::Pong { .. } => {}
+        Envelope::Shutdown { reason } => {
+            if shutdown_reason.is_none() {
+                *shutdown_reason = Some(reason);
+            }
+        }
         _ => {
             *end_category = Some("unexpected_envelope".into());
         }
@@ -918,6 +951,18 @@ fn spawn_transport(
                             };
                             (Message::Text(text.into()), Some(sent))
                         }
+                        TransportCommand::ShutdownComplete { envelope, sent } => {
+                            let text = match envelope.to_text() {
+                                Ok(text) => text,
+                                Err(_) => return,
+                            };
+                            if socket.send(Message::Text(text.into())).await.is_err() {
+                                return;
+                            }
+                            let _ = socket.send(Message::Close(None)).await;
+                            let _ = sent.send(());
+                            return;
+                        }
                     };
                     if socket.send(message).await.is_err() {
                         let _ = events.try_send(TransportEvent {
@@ -948,19 +993,14 @@ fn spawn_transport(
                             }
                         }
                         Some(Ok(Message::Pong(_))) => TransportEventKind::Activity,
-                        Some(Ok(Message::Close(frame))) => {
-                            let intentional = frame.as_ref().is_some_and(|frame| {
-                                frame.reason == "local stdin closed"
-                            });
-                            TransportEventKind::Closed { intentional }
-                        }
+                        Some(Ok(Message::Close(_))) => TransportEventKind::Closed,
                         Some(Ok(Message::Binary(_))) => TransportEventKind::InvalidEnvelope,
                         Some(Err(_)) | None => TransportEventKind::Disconnected,
                     };
                     let terminal = matches!(
                         kind,
                         TransportEventKind::Disconnected
-                            | TransportEventKind::Closed { .. }
+                            | TransportEventKind::Closed
                             | TransportEventKind::InvalidEnvelope
                     );
                     if events.send(TransportEvent { generation, kind }).await.is_err() || terminal {
@@ -1099,15 +1139,40 @@ async fn send_exit(
 ) -> bool {
     let (code, signal) = exit_details(status);
     let (sent_tx, sent_rx) = oneshot::channel();
-    if transport
-        .commands
-        .send(TransportCommand::Exit {
-            envelope: Envelope::Exit { code, signal },
-            sent: sent_tx,
-        })
-        .await
-        .is_err()
-    {
+    if !matches!(
+        timeout(
+            shutdown_timeout,
+            transport.commands.send(TransportCommand::Exit {
+                envelope: Envelope::Exit { code, signal },
+                sent: sent_tx,
+            })
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return false;
+    }
+    timeout(shutdown_timeout, sent_rx).await.is_ok()
+}
+
+async fn send_shutdown_complete(
+    transport: &TransportHandle,
+    status: &ExitStatus,
+    shutdown_timeout: Duration,
+) -> bool {
+    let (code, signal) = exit_details(status);
+    let (sent_tx, sent_rx) = oneshot::channel();
+    if !matches!(
+        timeout(
+            shutdown_timeout,
+            transport.commands.send(TransportCommand::ShutdownComplete {
+                envelope: Envelope::ShutdownComplete { code, signal },
+                sent: sent_tx,
+            })
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return false;
     }
     timeout(shutdown_timeout, sent_rx).await.is_ok()

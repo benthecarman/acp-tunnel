@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io::BufRead,
     net::{IpAddr, ToSocketAddrs},
     time::Duration,
 };
@@ -7,17 +8,14 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncWriteExt, BufWriter},
     net::TcpStream,
+    sync::mpsc,
     time::{Instant, timeout},
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        protocol::{WebSocketConfig, frame::coding::CloseCode},
-    },
+    tungstenite::{Message, client::IntoClientRequest, protocol::WebSocketConfig},
 };
 use url::{Host, Url};
 use uuid::Uuid;
@@ -26,7 +24,7 @@ use crate::{
     Error, Result,
     config::validate_id,
     credentials::SecretToken,
-    protocol::{AckStream, ClientInfo, Envelope, ResumeRequest, TUNNEL_VERSION},
+    protocol::{AckStream, ClientInfo, Envelope, ResumeRequest, ShutdownReason, TUNNEL_VERSION},
 };
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -54,6 +52,8 @@ pub struct ConnectOptions {
     pub keepalive_timeout: Duration,
     /// Maximum time spent reconnecting one detached tunnel.
     pub reconnect_timeout: Duration,
+    /// Maximum time spent completing intentional remote-agent shutdown.
+    pub shutdown_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -65,6 +65,43 @@ struct ResumeCredentials {
 struct PendingFrame {
     sequence: u64,
     payload: String,
+}
+
+/// Reusable sender for an intentional connector shutdown request.
+#[derive(Clone, Debug)]
+pub struct ShutdownHandle {
+    sender: mpsc::UnboundedSender<ShutdownReason>,
+}
+
+impl ShutdownHandle {
+    /// Requests shutdown and returns false if the connector already stopped.
+    pub fn shutdown(&self, reason: ShutdownReason) -> bool {
+        self.sender.send(reason).is_ok()
+    }
+}
+
+/// Receiver paired with a [`ShutdownHandle`].
+pub struct ShutdownSignal {
+    receiver: mpsc::UnboundedReceiver<ShutdownReason>,
+}
+
+impl ShutdownSignal {
+    fn try_receive(&mut self) -> Option<ShutdownReason> {
+        self.receiver.try_recv().ok()
+    }
+
+    async fn receive(&mut self) -> ShutdownReason {
+        match self.receiver.recv().await {
+            Some(reason) => reason,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Creates a reusable shutdown handle and its single connector-side receiver.
+pub fn shutdown_channel() -> (ShutdownHandle, ShutdownSignal) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (ShutdownHandle { sender }, ShutdownSignal { receiver })
 }
 
 /// Validates a client URL, including the non-loopback TLS requirement.
@@ -84,10 +121,20 @@ pub fn validate_connect_url(url: &Url) -> Result<()> {
 /// Runs the stdio-to-WebSocket client. This function never writes to stdout
 /// except for remote ACP payload lines.
 pub async fn connect(options: ConnectOptions) -> Result<()> {
+    let (handle, signal) = shutdown_channel();
+    let result = connect_with_shutdown(options, signal).await;
+    drop(handle);
+    result
+}
+
+/// Runs the connector with a reusable external shutdown signal.
+pub async fn connect_with_shutdown(
+    options: ConnectOptions,
+    mut shutdown: ShutdownSignal,
+) -> Result<()> {
     validate_options(&options)?;
     let (mut socket, credentials) = open_socket(&options, None).await?;
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut lines = spawn_stdin_reader()?;
     let mut stdout = BufWriter::new(tokio::io::stdout());
     let mut pending = VecDeque::<PendingFrame>::new();
     let mut pending_bytes = 0_usize;
@@ -102,9 +149,9 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                     .max_replay_bytes
                     .saturating_sub(options.max_frame_bytes);
         tokio::select! {
-            line = lines.next_line(), if can_read_stdin => {
-                match line? {
-                    Some(line) => {
+            line = lines.recv(), if can_read_stdin => {
+                match line {
+                    Some(Ok(line)) => {
                         if line.len() > options.max_frame_bytes {
                             return Err(Error::Protocol(format!(
                                 "local ACP line exceeds {} bytes",
@@ -128,22 +175,26 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                             Error::Protocol("client replay queue unexpectedly empty".into())
                         })?;
                         if send_acp(&mut socket, frame).await.is_err() {
-                            socket = reconnect_and_replay(
+                            let Some(reconnected) = reconnect_and_replay(
                                 &options,
                                 &credentials,
                                 &pending,
-                            ).await?;
+                                &mut shutdown,
+                            ).await? else {
+                                return Ok(());
+                            };
+                            socket = reconnected;
                             last_received = Instant::now();
                         }
                     }
+                    Some(Err(error)) => return Err(error.into()),
                     None => {
-                        let _ = socket.send(Message::Close(Some(
-                            tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                                code: CloseCode::Normal,
-                                reason: "local stdin closed".into(),
-                            },
-                        ))).await;
-                        return Ok(());
+                        return graceful_shutdown(
+                            &options,
+                            &credentials,
+                            Some(socket),
+                            ShutdownReason::StdinEof,
+                        ).await;
                     }
                 }
             }
@@ -151,7 +202,15 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                 let message = match message {
                     Some(Ok(message)) => message,
                     Some(Err(_)) | None => {
-                        socket = reconnect_and_replay(&options, &credentials, &pending).await?;
+                        let Some(reconnected) = reconnect_and_replay(
+                            &options,
+                            &credentials,
+                            &pending,
+                            &mut shutdown,
+                        ).await? else {
+                            return Ok(());
+                        };
+                        socket = reconnected;
                         last_received = Instant::now();
                         continue;
                     }
@@ -184,17 +243,21 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                                 stream: AckStream::ServerToClient,
                                 sequence: acknowledged,
                             }.to_text()?.into())).await.is_err() {
-                                socket = reconnect_and_replay(
+                                let Some(reconnected) = reconnect_and_replay(
                                     &options,
                                     &credentials,
                                     &pending,
-                                ).await?;
+                                    &mut shutdown,
+                                ).await? else {
+                                    return Ok(());
+                                };
+                                socket = reconnected;
                                 last_received = Instant::now();
                             }
                         }
                         Envelope::Acp { sequence: None, .. } => {
                             return Err(Error::Protocol(
-                                "tunnel v2 ACP frame is missing a sequence number".into(),
+                                "tunnel v3 ACP frame is missing a sequence number".into(),
                             ));
                         }
                         Envelope::Ack {
@@ -227,11 +290,15 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                             if socket.send(Message::Text(
                                 Envelope::Pong { nonce }.to_text()?.into()
                             )).await.is_err() {
-                                socket = reconnect_and_replay(
+                                let Some(reconnected) = reconnect_and_replay(
                                     &options,
                                     &credentials,
                                     &pending,
-                                ).await?;
+                                    &mut shutdown,
+                                ).await? else {
+                                    return Ok(());
+                                };
+                                socket = reconnected;
                                 last_received = Instant::now();
                             }
                         }
@@ -250,20 +317,35 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
                         Envelope::Open { .. } | Envelope::Ready { .. } => {
                             return Err(Error::Protocol("unexpected handshake envelope".into()));
                         }
+                        Envelope::Shutdown { .. } | Envelope::ShutdownComplete { .. } => {
+                            return Err(Error::Protocol("unexpected shutdown envelope".into()));
+                        }
                     },
                     Message::Ping(payload) => {
                         if socket.send(Message::Pong(payload)).await.is_err() {
-                            socket = reconnect_and_replay(
+                            let Some(reconnected) = reconnect_and_replay(
                                 &options,
                                 &credentials,
                                 &pending,
-                            ).await?;
+                                &mut shutdown,
+                            ).await? else {
+                                return Ok(());
+                            };
+                            socket = reconnected;
                             last_received = Instant::now();
                         }
                     }
                     Message::Pong(_) => {}
                     Message::Close(_) => {
-                        socket = reconnect_and_replay(&options, &credentials, &pending).await?;
+                        let Some(reconnected) = reconnect_and_replay(
+                            &options,
+                            &credentials,
+                            &pending,
+                            &mut shutdown,
+                        ).await? else {
+                            return Ok(());
+                        };
+                        socket = reconnected;
                         last_received = Instant::now();
                     }
                     Message::Binary(_) | Message::Frame(_) => {
@@ -275,11 +357,43 @@ pub async fn connect(options: ConnectOptions) -> Result<()> {
             }
             () = tokio::time::sleep_until(last_received + options.keepalive_timeout) => {
                 let _ = socket.close(None).await;
-                socket = reconnect_and_replay(&options, &credentials, &pending).await?;
+                let Some(reconnected) = reconnect_and_replay(
+                    &options,
+                    &credentials,
+                    &pending,
+                    &mut shutdown,
+                ).await? else {
+                    return Ok(());
+                };
+                socket = reconnected;
                 last_received = Instant::now();
+            }
+            reason = shutdown.receive() => {
+                return graceful_shutdown(
+                    &options,
+                    &credentials,
+                    Some(socket),
+                    reason,
+                ).await;
             }
         }
     }
+}
+
+fn spawn_stdin_reader() -> Result<mpsc::Receiver<std::io::Result<String>>> {
+    let (sender, receiver) = mpsc::channel(1);
+    std::thread::Builder::new()
+        .name("acp-tunnel-stdin".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                if sender.blocking_send(line).is_err() {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+    Ok(receiver)
 }
 
 fn validate_options(options: &ConnectOptions) -> Result<()> {
@@ -292,6 +406,7 @@ fn validate_options(options: &ConnectOptions) -> Result<()> {
         || options.connection_timeout.is_zero()
         || options.keepalive_timeout.is_zero()
         || options.reconnect_timeout.is_zero()
+        || options.shutdown_timeout.is_zero()
     {
         return Err(Error::Config(
             "client frame, replay, and timeout settings are invalid".into(),
@@ -367,7 +482,7 @@ async fn open_socket(
                 },
             )),
             Envelope::Error { code, message } => Err(Error::Protocol(format!("{code}: {message}"))),
-            _ => Err(Error::Protocol("expected tunnel v2 ready response".into())),
+            _ => Err(Error::Protocol("expected tunnel v3 ready response".into())),
         },
         _ => Err(Error::Protocol("expected text ready response".into())),
     }
@@ -377,11 +492,32 @@ async fn reconnect_and_replay(
     options: &ConnectOptions,
     credentials: &ResumeCredentials,
     pending: &VecDeque<PendingFrame>,
-) -> Result<ClientSocket> {
+    shutdown: &mut ShutdownSignal,
+) -> Result<Option<ClientSocket>> {
     let deadline = Instant::now() + options.reconnect_timeout;
     let mut delay = Duration::from_millis(200);
     loop {
-        match open_socket(options, Some(credentials)).await {
+        if let Some(reason) = shutdown.try_receive() {
+            graceful_shutdown(options, credentials, None, reason).await?;
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout("reconnecting detached tunnel"));
+        }
+        let attempt = tokio::select! {
+            reason = shutdown.receive() => {
+                graceful_shutdown(options, credentials, None, reason).await?;
+                return Ok(None);
+            }
+            result = timeout(remaining, open_socket(options, Some(credentials))) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Timeout("reconnecting detached tunnel")),
+                }
+            }
+        };
+        match attempt {
             Ok((mut socket, returned_credentials))
                 if returned_credentials.connection_id == credentials.connection_id
                     && returned_credentials.resume_token == credentials.resume_token =>
@@ -395,7 +531,7 @@ async fn reconnect_and_replay(
                 }
                 if !replay_failed {
                     write_diagnostic("reconnected to remote ACP agent").await;
-                    return Ok(socket);
+                    return Ok(Some(socket));
                 }
             }
             Ok(_) => {
@@ -410,9 +546,158 @@ async fn reconnect_and_replay(
         if Instant::now() >= deadline {
             return Err(Error::Timeout("reconnecting detached tunnel"));
         }
-        tokio::time::sleep(delay.min(deadline.saturating_duration_since(Instant::now()))).await;
+        let sleep =
+            tokio::time::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+        tokio::pin!(sleep);
+        tokio::select! {
+            reason = shutdown.receive() => {
+                graceful_shutdown(options, credentials, None, reason).await?;
+                return Ok(None);
+            }
+            () = &mut sleep => {}
+        }
         delay = (delay * 2).min(Duration::from_secs(5));
     }
+}
+
+async fn graceful_shutdown(
+    options: &ConnectOptions,
+    credentials: &ResumeCredentials,
+    socket: Option<ClientSocket>,
+    reason: ShutdownReason,
+) -> Result<()> {
+    timeout(
+        options.shutdown_timeout,
+        graceful_shutdown_inner(options, credentials, socket, reason),
+    )
+    .await
+    .map_err(|_| Error::Timeout("waiting for remote shutdown confirmation"))?
+}
+
+async fn graceful_shutdown_inner(
+    options: &ConnectOptions,
+    credentials: &ResumeCredentials,
+    mut socket: Option<ClientSocket>,
+    reason: ShutdownReason,
+) -> Result<()> {
+    let deadline = Instant::now() + options.shutdown_timeout;
+    let mut delay = Duration::from_millis(100);
+    loop {
+        if Instant::now() >= deadline {
+            if let Some(mut socket) = socket {
+                close_transport(&mut socket).await;
+            }
+            return Err(Error::Timeout("waiting for remote shutdown confirmation"));
+        }
+
+        let mut current = match socket.take() {
+            Some(socket) => socket,
+            None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match timeout(remaining, open_socket(options, Some(credentials))).await {
+                    Ok(Ok((socket, returned)))
+                        if returned.connection_id == credentials.connection_id
+                            && returned.resume_token == credentials.resume_token =>
+                    {
+                        socket
+                    }
+                    Ok(Ok(_)) => {
+                        return Err(Error::Protocol(
+                            "server changed resume credentials during shutdown".into(),
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        write_diagnostic(&format!("shutdown reconnect failed: {error}")).await;
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Err(Error::Timeout(
+                                "reconnecting to shut down detached tunnel",
+                            ));
+                        }
+                        tokio::time::sleep(delay.min(remaining)).await;
+                        delay = (delay * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(Error::Timeout("reconnecting to shut down detached tunnel"));
+                    }
+                }
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let shutdown = Envelope::Shutdown {
+            reason: reason.clone(),
+        }
+        .to_text()?;
+        match timeout(remaining, current.send(Message::Text(shutdown.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => continue,
+            Err(_) => {
+                close_transport(&mut current).await;
+                return Err(Error::Timeout("sending remote shutdown request"));
+            }
+        }
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                close_transport(&mut current).await;
+                return Err(Error::Timeout("waiting for remote shutdown confirmation"));
+            }
+            let message = match timeout(remaining, current.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => {
+                    close_transport(&mut current).await;
+                    return Err(Error::Timeout("waiting for remote shutdown confirmation"));
+                }
+            };
+            match message {
+                Message::Text(text) => match Envelope::from_text(&text)? {
+                    Envelope::ShutdownComplete { .. } => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let _ = timeout(remaining, current.close(None)).await;
+                        return Ok(());
+                    }
+                    Envelope::Ping { nonce } => {
+                        current
+                            .send(Message::Text(Envelope::Pong { nonce }.to_text()?.into()))
+                            .await?;
+                    }
+                    Envelope::Stderr { payload } => {
+                        write_diagnostic(&payload).await;
+                    }
+                    Envelope::Exit { .. }
+                    | Envelope::Ack { .. }
+                    | Envelope::Pong { .. }
+                    | Envelope::Acp { .. } => {}
+                    Envelope::Error { code, message } => {
+                        return Err(Error::Protocol(format!("{code}: {message}")));
+                    }
+                    Envelope::Open { .. } | Envelope::Ready { .. } | Envelope::Shutdown { .. } => {
+                        return Err(Error::Protocol(
+                            "unexpected envelope during shutdown".into(),
+                        ));
+                    }
+                },
+                Message::Ping(payload) => {
+                    current.send(Message::Pong(payload)).await?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(_) => break,
+                Message::Binary(_) | Message::Frame(_) => {
+                    return Err(Error::Protocol(
+                        "binary WebSocket messages are not supported".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn close_transport(socket: &mut ClientSocket) {
+    let _ = timeout(Duration::from_millis(100), socket.close(None)).await;
 }
 
 async fn send_acp(socket: &mut ClientSocket, frame: &PendingFrame) -> Result<()> {
@@ -498,6 +783,7 @@ mod tests {
             connection_timeout: Duration::from_secs(1),
             keepalive_timeout: Duration::from_secs(1),
             reconnect_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(1),
         };
         let formatted = format!("{options:?}");
         assert!(!formatted.contains("connect-debug-secret"));
@@ -593,6 +879,7 @@ mod tests {
             connection_timeout: Duration::from_secs(2),
             keepalive_timeout: Duration::from_secs(2),
             reconnect_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::from_secs(2),
         };
         let (mut socket, credentials) = open_socket(&options, None).await.unwrap();
         let pending = VecDeque::from([PendingFrame {
@@ -603,10 +890,115 @@ mod tests {
             .await
             .unwrap();
         drop(socket);
-        let resumed = reconnect_and_replay(&options, &credentials, &pending)
+        let (_handle, mut shutdown) = shutdown_channel();
+        let resumed = reconnect_and_replay(&options, &credentials, &pending, &mut shutdown)
             .await
+            .unwrap()
             .unwrap();
         drop(resumed);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_reconnect_resumes_only_for_bounded_cleanup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut first = accept_async(stream).await.unwrap();
+            let _ = first.next().await.unwrap().unwrap();
+            first
+                .send(Message::Text(
+                    Envelope::Ready {
+                        tunnel_version: TUNNEL_VERSION,
+                        connection_id: "connection".into(),
+                        resume_token: Some("resume-secret".into()),
+                        resumed: false,
+                    }
+                    .to_text()
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            drop(first);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut cleanup = accept_async(stream).await.unwrap();
+            let open = cleanup.next().await.unwrap().unwrap();
+            let Message::Text(open) = open else {
+                panic!("expected cleanup resume");
+            };
+            assert!(matches!(
+                Envelope::from_text(&open).unwrap(),
+                Envelope::Open {
+                    resume: Some(_),
+                    ..
+                }
+            ));
+            cleanup
+                .send(Message::Text(
+                    Envelope::Ready {
+                        tunnel_version: TUNNEL_VERSION,
+                        connection_id: "connection".into(),
+                        resume_token: Some("resume-secret".into()),
+                        resumed: true,
+                    }
+                    .to_text()
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let shutdown = cleanup.next().await.unwrap().unwrap();
+            let Message::Text(shutdown) = shutdown else {
+                panic!("expected shutdown envelope");
+            };
+            assert!(matches!(
+                Envelope::from_text(&shutdown).unwrap(),
+                Envelope::Shutdown {
+                    reason: ShutdownReason::ClientShutdown
+                }
+            ));
+            cleanup
+                .send(Message::Text(
+                    Envelope::ShutdownComplete {
+                        code: Some(0),
+                        signal: None,
+                    }
+                    .to_text()
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let options = ConnectOptions {
+            url: Url::parse(&format!("ws://{address}/v1/tunnel")).unwrap(),
+            agent: "fake".into(),
+            workspace: "project".into(),
+            token: SecretToken::new("token".into()).unwrap(),
+            max_frame_bytes: 1024,
+            max_replay_frames: 8,
+            max_replay_bytes: 8192,
+            connection_timeout: Duration::from_secs(2),
+            keepalive_timeout: Duration::from_secs(2),
+            reconnect_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::from_secs(2),
+        };
+        let (socket, credentials) = open_socket(&options, None).await.unwrap();
+        drop(socket);
+        let pending = VecDeque::from([PendingFrame {
+            sequence: 1,
+            payload: r#"{"id":1}"#.into(),
+        }]);
+        let (handle, mut shutdown) = shutdown_channel();
+        assert!(handle.shutdown(ShutdownReason::ClientShutdown));
+        let result = reconnect_and_replay(&options, &credentials, &pending, &mut shutdown)
+            .await
+            .unwrap();
+        assert!(result.is_none());
         server.await.unwrap();
     }
 }

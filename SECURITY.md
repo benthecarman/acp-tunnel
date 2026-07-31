@@ -41,6 +41,13 @@ Reconnect uses a random, per-session resume capability in addition to the
 bearer token. Treat this capability as a secret. It is intentionally memory-only
 and expires when the session ends or its reconnect grace period elapses.
 
+An explicit shutdown removes the resume capability before process cleanup.
+Unexpected transport loss keeps the capability active for the configured grace
+period. A WebSocket close without a `shutdown` envelope is unexpected.
+
+Supervisors must close connector stdin or send SIGTERM before SIGKILL. SIGKILL
+cannot be caught, so it cannot request immediate remote cleanup.
+
 Load the bearer token from `--token-file`, `ACP_TUNNEL_TOKEN_FILE`, or
 `ACP_TUNNEL_TOKEN`. A file keeps the token out of process environment listings
 and application configuration. Restrict the file permissions when the runtime

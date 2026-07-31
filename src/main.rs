@@ -6,9 +6,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Du
 use acp_tunnel::{
     Error, Result,
     auth::StaticTokenAuthenticator,
-    client::{ConnectOptions, connect},
+    client::{ConnectOptions, ShutdownHandle, connect_with_shutdown, shutdown_channel},
     config::ServerConfig,
     credentials::load_token,
+    protocol::ShutdownReason,
     server::{ServerState, serve},
 };
 use clap::{Parser, Subcommand};
@@ -60,6 +61,9 @@ enum Command {
         /// Maximum time spent reconnecting a detached tunnel.
         #[arg(long, default_value_t = 30)]
         reconnect_timeout_seconds: u64,
+        /// Maximum time to wait for remote shutdown confirmation.
+        #[arg(long, default_value_t = 10)]
+        shutdown_timeout_seconds: u64,
         /// Read the bearer credential from this file.
         #[arg(long)]
         token_file: Option<PathBuf>,
@@ -87,7 +91,14 @@ enum Command {
     },
     /// Internal infrastructure-free integration-test ACP agent.
     #[command(name = "__test-agent", hide = true)]
-    TestAgent,
+    TestAgent {
+        /// Ignore SIGTERM and remain alive after stdin closes.
+        #[arg(long, hide = true)]
+        uncooperative: bool,
+        /// Start an uncooperative process in the same process group.
+        #[arg(long, hide = true)]
+        spawn_grandchild: bool,
+    },
 }
 
 #[tokio::main]
@@ -114,21 +125,28 @@ async fn run() -> Result<()> {
             connect_timeout_seconds,
             keepalive_timeout_seconds,
             reconnect_timeout_seconds,
+            shutdown_timeout_seconds,
             token_file,
         } => {
             let token = load_token(token_file.as_deref())?;
-            connect(ConnectOptions {
-                url,
-                agent,
-                workspace,
-                token,
-                max_frame_bytes,
-                max_replay_frames,
-                max_replay_bytes,
-                connection_timeout: Duration::from_secs(connect_timeout_seconds),
-                keepalive_timeout: Duration::from_secs(keepalive_timeout_seconds),
-                reconnect_timeout: Duration::from_secs(reconnect_timeout_seconds),
-            })
+            let (shutdown_handle, shutdown_signal) = shutdown_channel();
+            install_connector_signal_handler(shutdown_handle)?;
+            connect_with_shutdown(
+                ConnectOptions {
+                    url,
+                    agent,
+                    workspace,
+                    token,
+                    max_frame_bytes,
+                    max_replay_frames,
+                    max_replay_bytes,
+                    connection_timeout: Duration::from_secs(connect_timeout_seconds),
+                    keepalive_timeout: Duration::from_secs(keepalive_timeout_seconds),
+                    reconnect_timeout: Duration::from_secs(reconnect_timeout_seconds),
+                    shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
+                },
+                shutdown_signal,
+            )
             .await
         }
         Command::Serve {
@@ -145,12 +163,7 @@ async fn run() -> Result<()> {
             config.validate()?;
             let token = load_token(token_file.as_deref())?;
             let shutdown = CancellationToken::new();
-            let signal_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    signal_shutdown.cancel();
-                }
-            });
+            install_server_signal_handler(shutdown.clone())?;
             let state = ServerState::new(
                 Arc::new(config),
                 Arc::new(StaticTokenAuthenticator::new(token)),
@@ -168,8 +181,71 @@ async fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::TestAgent => run_test_agent().await,
+        Command::TestAgent {
+            uncooperative,
+            spawn_grandchild,
+        } => run_test_agent(uncooperative, spawn_grandchild).await,
     }
+}
+
+#[cfg(unix)]
+fn install_connector_signal_handler(handle: ShutdownHandle) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|error| Error::Config(format!("cannot install SIGTERM handler: {error}")))?;
+    let sigterm_handle = handle.clone();
+    tokio::spawn(async move {
+        if sigterm.recv().await.is_some() {
+            let _ = sigterm_handle.shutdown(ShutdownReason::Sigterm);
+        }
+    });
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = handle.shutdown(ShutdownReason::Interrupt);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_connector_signal_handler(handle: ShutdownHandle) -> Result<()> {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = handle.shutdown(ShutdownReason::Interrupt);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_server_signal_handler(shutdown: CancellationToken) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|error| Error::Config(format!("cannot install SIGTERM handler: {error}")))?;
+    let sigterm_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if sigterm.recv().await.is_some() {
+            sigterm_shutdown.cancel();
+        }
+    });
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.cancel();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_server_signal_handler(shutdown: CancellationToken) -> Result<()> {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.cancel();
+        }
+    });
+    Ok(())
 }
 
 fn init_server_logging() -> Result<()> {
@@ -182,7 +258,33 @@ fn init_server_logging() -> Result<()> {
         .map_err(|error| Error::Config(format!("cannot initialize structured logging: {error}")))
 }
 
-async fn run_test_agent() -> Result<()> {
+async fn run_test_agent(uncooperative: bool, spawn_grandchild: bool) -> Result<()> {
+    if spawn_grandchild {
+        let executable = std::env::current_exe()
+            .map_err(|error| Error::Process(format!("cannot find test executable: {error}")))?;
+        let grandchild = std::process::Command::new(executable)
+            .args(["__test-agent", "--uncooperative"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                Error::Process(format!("cannot start test-agent grandchild: {error}"))
+            })?;
+        eprintln!("fake-agent grandchild-pid={}", grandchild.id());
+    }
+
+    #[cfg(unix)]
+    let mut sigterm = if uncooperative {
+        Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(
+                |error| Error::Process(format!("cannot install test SIGTERM handler: {error}")),
+            )?,
+        )
+    } else {
+        None
+    };
+
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = BufWriter::new(tokio::io::stdout());
     eprintln!("fake-agent pid={}", std::process::id());
@@ -296,6 +398,15 @@ async fn run_test_agent() -> Result<()> {
             }
             _ => {}
         }
+    }
+
+    if uncooperative {
+        #[cfg(unix)]
+        if let Some(signal) = sigterm.as_mut() {
+            while signal.recv().await.is_some() {}
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
     }
     Ok(())
 }

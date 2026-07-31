@@ -118,12 +118,26 @@ Browser `Origin` headers are rejected unless their exact value appears in
 `--insecure-listen` is explicitly supplied. A client requires `wss://` except
 for loopback destinations.
 
-On an unexpected network loss, the server keeps the complete agent process group
-alive for `reconnect_grace_seconds`. The authenticated connector resumes the
-same process and replays only unacknowledged ACP frames. Clean stdin EOF,
-reconnect-grace expiration, or server shutdown terminates and reaps the process
-group. This covers grandchildren on Linux and macOS. Windows is supported for
-the local `connect` command; the server targets Linux and macOS.
+The connector uses an explicit shutdown exchange for stdin EOF, SIGTERM,
+SIGINT, Ctrl-C, and library shutdown requests. The server first closes the
+agent stdin. It then escalates to SIGTERM and SIGKILL when the agent does not
+exit. The connector waits for confirmation and sends a normal WebSocket close
+frame.
+
+On an unexpected network loss, the server keeps the complete agent process
+group alive for `reconnect_grace_seconds`. The authenticated connector resumes
+the same process and replays only unacknowledged ACP frames.
+
+```text
+explicit shutdown
+    → remote process terminates immediately
+
+unexpected network failure
+    → remote process remains resumable during the grace period
+```
+
+This process-group cleanup covers grandchildren on Linux and macOS. Windows
+supports the local `connect` command. The server targets Linux and macOS.
 
 The remote host is part of the trusted computing base. It sees ACP traffic,
 prompts, workspace files, agent credentials, and tool activity. Protect the
@@ -183,6 +197,11 @@ Reconnect state is memory-only. It survives transient WebSocket and proxy
 failures while both `acp-tunnel` processes remain alive, but it does not survive
 a connector or server process restart.
 
+The connector waits 10 seconds for `shutdown_complete` by default. Set
+`--shutdown-timeout-seconds` to change this limit. If the timeout expires, the
+connector closes the transport and exits nonzero. It does not resume normal
+reconnect attempts.
+
 ## TLS and reverse proxies
 
 For direct TLS, set `[tls].cert_path` and `[tls].key_path`. For a reverse proxy,
@@ -223,6 +242,14 @@ clients.
 reconnect on stderr. Raise proxy read/send timeouts above the server keepalive
 timeout, confirm WebSocket upgrades are forwarded, and ensure the connector's
 reconnect timeout does not exceed the server grace period.
+
+**A supervisor leaves a remote agent running:** Configure the supervisor to
+close connector stdin or send SIGTERM. Wait longer than the connector shutdown
+timeout before you send SIGKILL. SIGKILL cannot start the shutdown exchange.
+
+**Shutdown confirmation times out:** Make sure that the connector can reach the
+server during the full shutdown timeout. The server reconnect grace remains the
+final cleanup fallback after a failed cleanup resume.
 
 ## Documentation
 

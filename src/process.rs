@@ -113,6 +113,45 @@ impl AgentProcess {
 
         terminate_group(self.pid, false, &mut self.child)?;
         if let Ok(status) = timeout(shutdown_timeout, self.child.wait()).await {
+            let status = status.map_err(|error| {
+                Error::Process(format!("cannot reap agent after termination: {error}"))
+            })?;
+            cleanup_remaining_group(self.pid, shutdown_timeout).await?;
+            return Ok(status);
+        }
+
+        terminate_group(self.pid, true, &mut self.child)?;
+        timeout(shutdown_timeout, self.child.wait())
+            .await
+            .map_err(|_| Error::Timeout("force-killing remote agent"))?
+            .map_err(|error| Error::Process(format!("cannot reap force-killed agent: {error}")))
+    }
+
+    /// Waits for a cooperative exit, then escalates from termination to force-kill.
+    pub async fn graceful_shutdown_and_reap(
+        &mut self,
+        graceful_exit_timeout: Duration,
+        shutdown_timeout: Duration,
+    ) -> Result<ExitStatus> {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|error| Error::Process(format!("cannot inspect agent status: {error}")))?
+        {
+            cleanup_remaining_group(self.pid, shutdown_timeout).await?;
+            return Ok(status);
+        }
+
+        if let Ok(status) = timeout(graceful_exit_timeout, self.child.wait()).await {
+            let status = status.map_err(|error| {
+                Error::Process(format!("cannot reap agent after stdin closure: {error}"))
+            })?;
+            cleanup_remaining_group(self.pid, shutdown_timeout).await?;
+            return Ok(status);
+        }
+
+        terminate_group(self.pid, false, &mut self.child)?;
+        if let Ok(status) = timeout(shutdown_timeout, self.child.wait()).await {
             return status.map_err(|error| {
                 Error::Process(format!("cannot reap agent after termination: {error}"))
             });
@@ -123,6 +162,53 @@ impl AgentProcess {
             .await
             .map_err(|_| Error::Timeout("force-killing remote agent"))?
             .map_err(|error| Error::Process(format!("cannot reap force-killed agent: {error}")))
+    }
+}
+
+#[cfg(unix)]
+async fn cleanup_remaining_group(pid: u32, shutdown_timeout: Duration) -> Result<()> {
+    if !process_group_exists(pid)? {
+        return Ok(());
+    }
+    signal_group(pid, false)?;
+    if wait_for_process_group_exit(pid, shutdown_timeout).await? {
+        return Ok(());
+    }
+    signal_group(pid, true)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn cleanup_remaining_group(_pid: u32, _shutdown_timeout: Duration) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    let raw_pid = i32::try_from(pid)
+        .map_err(|_| Error::Process("agent process ID is outside the platform range".into()))?;
+    match killpg(Pid::from_raw(raw_pid), None) {
+        Ok(()) | Err(Errno::EPERM) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(Error::Process(format!(
+            "cannot inspect agent process group: {error}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(pid: u32, duration: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        if !process_group_exists(pid)? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -166,6 +252,11 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_group(pid: u32, force: bool, _child: &mut Child) -> Result<()> {
+    signal_group(pid, force)
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, force: bool) -> Result<()> {
     use nix::{
         sys::signal::{Signal, killpg},
         unistd::Pid,

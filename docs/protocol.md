@@ -1,12 +1,15 @@
-# acp-tunnel protocol v2
+# acp-tunnel protocol v3
 
 The tunnel protocol is independent of the ACP protocol version. It uses one
 authenticated WebSocket at `GET /v1/tunnel`. Every application message is a
 WebSocket text message containing one JSON object. Binary messages are invalid.
 
-Protocol v2 adds authenticated transport resumption and ordered,
-acknowledgement-based ACP replay. Reconnect state is held in memory and is not a
-durable session store.
+Protocol v3 includes authenticated transport resumption, ordered ACP replay,
+and explicit remote-agent shutdown. Reconnect state is held in memory. It is
+not a durable session store.
+
+The server rejects all other tunnel versions. It does not negotiate or fall
+back to protocol v2. Update the connector and server together.
 
 ## Authentication and upgrade
 
@@ -28,7 +31,7 @@ The first message on a new tunnel is:
 ```json
 {
   "type": "open",
-  "tunnelVersion": 2,
+  "tunnelVersion": 3,
   "agent": "codex",
   "workspace": "project-a",
   "clientInfo": {
@@ -44,7 +47,7 @@ one process, the server returns:
 ```json
 {
   "type": "ready",
-  "tunnelVersion": 2,
+  "tunnelVersion": 3,
   "connectionId": "opaque-id",
   "resumeToken": "single-session-secret",
   "resumed": false
@@ -63,7 +66,7 @@ WebSocket and sends:
 ```json
 {
   "type": "open",
-  "tunnelVersion": 2,
+  "tunnelVersion": 3,
   "agent": "codex",
   "workspace": "project-a",
   "clientInfo": {
@@ -145,6 +148,38 @@ diagnostic queue is full. ACP replay traffic takes priority.
 
 ## Lifecycle and errors
 
+An intentional connector shutdown starts with:
+
+```json
+{
+  "type": "shutdown",
+  "reason": "stdin_eof"
+}
+```
+
+The initial reasons are `stdin_eof`, `sigterm`, `interrupt`, and
+`client_shutdown`. A protocol v3 receiver accepts unknown reason strings for
+future extensions.
+
+The server removes the resume capability before it starts process cleanup. It
+then flushes and closes the agent stdin. This gives the agent a bounded period
+to exit. If the process remains alive, the server sends SIGTERM to the process
+group. It sends SIGKILL after the configured shutdown timeout.
+
+After it reaps the direct child, the server replies:
+
+```json
+{
+  "type": "shutdown_complete",
+  "code": 0,
+  "signal": null
+}
+```
+
+The connector waits for this envelope for its configured shutdown timeout.
+Then both peers send a normal WebSocket close frame. A confirmed shutdown is
+successful even when the final agent status is nonzero.
+
 Process termination:
 
 ```json
@@ -181,14 +216,21 @@ unbounded buffering; the default is 10 MiB. Replay queues have independent
 frame-count and byte limits. When a queue fills, reading from the producing pipe
 stops until acknowledgements provide space.
 
-Local stdin EOF sends a normal close frame with the reason
-`local stdin closed`. This is an intentional shutdown and is not resumed.
-Unexpected close, I/O failure, or keepalive expiry detaches the transport.
+Local stdin EOF sends `shutdown` with reason `stdin_eof`. SIGTERM sends reason
+`sigterm`. SIGINT and Ctrl-C send reason `interrupt`. An embedding application
+can use the shutdown handle and reason `client_shutdown`.
+
+If shutdown starts while the connector is detached, normal reconnect attempts
+stop. The connector makes a bounded resume attempt only to send `shutdown`. It
+does not start a new agent.
+
+All WebSocket closes without a preceding `shutdown` are unexpected. An I/O
+failure or keepalive expiry also detaches the transport.
 
 The server retains the process for `reconnect_grace_seconds`. The connector
 retries with exponential backoff until `--reconnect-timeout-seconds` expires.
-Grace expiration, clean closure, or server shutdown terminates and reaps the
-complete remote process group.
+Grace expiration or server shutdown terminates and reaps the complete remote
+process group.
 
 ## ACP payload handling
 

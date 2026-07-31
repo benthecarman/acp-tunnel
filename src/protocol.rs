@@ -1,11 +1,11 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Result};
 
 /// The current tunnel protocol version.
-pub const TUNNEL_VERSION: u32 = 2;
+pub const TUNNEL_VERSION: u32 = 3;
 
 /// Metadata describing a connecting client.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,6 +47,58 @@ pub enum AckStream {
     ServerToClient,
 }
 
+/// Why a connector intentionally ends a remote-agent session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShutdownReason {
+    /// The connector reached end-of-file on local standard input.
+    StdinEof,
+    /// The connector received SIGTERM.
+    Sigterm,
+    /// The connector received SIGINT or Ctrl-C.
+    Interrupt,
+    /// An embedding application requested shutdown.
+    ClientShutdown,
+    /// A reason introduced by a future tunnel version.
+    Unknown(String),
+}
+
+impl ShutdownReason {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::StdinEof => "stdin_eof",
+            Self::Sigterm => "sigterm",
+            Self::Interrupt => "interrupt",
+            Self::ClientShutdown => "client_shutdown",
+            Self::Unknown(reason) => reason,
+        }
+    }
+}
+
+impl Serialize for ShutdownReason {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ShutdownReason {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let reason = String::deserialize(deserializer)?;
+        Ok(match reason.as_str() {
+            "stdin_eof" => Self::StdinEof,
+            "sigterm" => Self::Sigterm,
+            "interrupt" => Self::Interrupt,
+            "client_shutdown" => Self::ClientShutdown,
+            _ => Self::Unknown(reason),
+        })
+    }
+}
+
 /// Versioned messages exchanged over the tunnel WebSocket.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -82,7 +134,7 @@ pub enum Envelope {
     },
     /// Carries one complete, opaque ACP NDJSON line.
     Acp {
-        /// Ordered stream sequence number in tunnel protocol v2.
+        /// Ordered stream sequence number in tunnel protocol v3.
         #[serde(skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
         /// The original ACP line without its line terminator.
@@ -102,6 +154,19 @@ pub enum Envelope {
     },
     /// Reports remote process termination.
     Exit {
+        /// Portable process exit code, when available.
+        code: Option<i32>,
+        /// Unix signal number, when available.
+        signal: Option<i32>,
+    },
+    /// Requests intentional termination of the remote-agent session.
+    Shutdown {
+        /// Stable connector shutdown reason.
+        reason: ShutdownReason,
+    },
+    /// Confirms that intentional remote-agent shutdown is complete.
+    #[serde(rename = "shutdown_complete")]
+    ShutdownComplete {
         /// Portable process exit code, when available.
         code: Option<i32>,
         /// Unix signal number, when available.
@@ -174,6 +239,15 @@ impl fmt::Debug for Envelope {
                 .field("code", code)
                 .field("signal", signal)
                 .finish(),
+            Self::Shutdown { reason } => formatter
+                .debug_struct("Shutdown")
+                .field("reason", reason)
+                .finish(),
+            Self::ShutdownComplete { code, signal } => formatter
+                .debug_struct("ShutdownComplete")
+                .field("code", code)
+                .field("signal", signal)
+                .finish(),
             Self::Error { code, message } => formatter
                 .debug_struct("Error")
                 .field("code", code)
@@ -239,7 +313,7 @@ pub struct OpenRequest {
     pub workspace: String,
     /// Connecting client metadata.
     pub client_info: ClientInfo,
-    /// Resume credentials, when reconnecting a v2 tunnel.
+    /// Resume credentials, when reconnecting a v3 tunnel.
     pub resume: Option<ResumeRequest>,
 }
 
@@ -280,6 +354,50 @@ mod tests {
             resume: None,
         };
         assert!(matches!(open.into_open(), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn rejects_tunnel_version_two() {
+        let open = Envelope::Open {
+            tunnel_version: 2,
+            agent: "agent".into(),
+            workspace: "workspace".into(),
+            client_info: ClientInfo {
+                name: "test".into(),
+                version: "1".into(),
+            },
+            resume: None,
+        };
+        let error = open.into_open().unwrap_err().to_string();
+        assert!(error.contains("unsupported tunnel version 2"));
+        assert!(error.contains("expected 3"));
+    }
+
+    #[test]
+    fn shutdown_envelopes_have_stable_names_and_accept_future_reasons() {
+        let shutdown = Envelope::Shutdown {
+            reason: ShutdownReason::StdinEof,
+        };
+        assert_eq!(
+            serde_json::to_value(shutdown).unwrap(),
+            serde_json::json!({"type":"shutdown","reason":"stdin_eof"})
+        );
+        let complete = Envelope::ShutdownComplete {
+            code: Some(0),
+            signal: None,
+        };
+        assert_eq!(
+            serde_json::to_value(complete).unwrap(),
+            serde_json::json!({"type":"shutdown_complete","code":0,"signal":null})
+        );
+        let future =
+            Envelope::from_text(r#"{"type":"shutdown","reason":"future_reason"}"#).unwrap();
+        assert!(matches!(
+            future,
+            Envelope::Shutdown {
+                reason: ShutdownReason::Unknown(reason)
+            } if reason == "future_reason"
+        ));
     }
 
     #[test]

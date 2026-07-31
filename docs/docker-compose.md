@@ -117,7 +117,8 @@ services:
       - "127.0.0.1:8787:8787"
     init: true
     restart: unless-stopped
-    stop_grace_period: 15s
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -283,6 +284,10 @@ values. Add `HOME`, `PATH`, and required credentials to `pass_env`.
 The remote container is part of the trusted computing base. It can read ACP
 traffic, prompts, credentials, and all mounted workspace files.
 
+Compose sends SIGTERM and waits for `stop_grace_period`. Keep this period longer
+than the server shutdown timeout. SIGKILL cannot run the explicit shutdown
+exchange or flush agent stdin.
+
 Container isolation does not synchronize files. The selected workspace must
 already exist on the remote host.
 
@@ -309,3 +314,6 @@ the mount writable only when the agent must refresh its credential.
 
 **Reconnect stops too early:** Set `reconnect_grace_seconds` slightly higher
 than the connector value for `--reconnect-timeout-seconds`.
+
+**Container shutdown leaves work running:** Keep `stop_signal: SIGTERM`. Set
+`stop_grace_period` long enough for stdin closure, SIGTERM, and final cleanup.

@@ -13,10 +13,13 @@ use acp_tunnel::{
 };
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
-use nix::{sys::signal::kill, unistd::Pid};
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::Command,
     task::JoinHandle,
@@ -38,6 +41,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_agent_args(&[]).await
+    }
+
+    async fn start_with_agent_args(agent_args: &[&str]) -> Self {
         let executable = std::env::var("CARGO_BIN_EXE_acp-tunnel")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_acp-tunnel").to_owned());
         let workspace = tempfile::tempdir().unwrap();
@@ -66,7 +73,13 @@ impl TestServer {
             path = "{escaped_workspace}"
             "#
         );
-        let config: ServerConfig = toml::from_str(&source).unwrap();
+        let mut config: ServerConfig = toml::from_str(&source).unwrap();
+        config
+            .agents
+            .get_mut("fake")
+            .unwrap()
+            .args
+            .extend(agent_args.iter().map(|argument| (*argument).to_owned()));
         config.validate().unwrap();
         let shutdown = CancellationToken::new();
         let state = ServerState::new(
@@ -147,6 +160,42 @@ impl TestServer {
     async fn stop(self) {
         self.shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(3), self.task).await;
+    }
+}
+
+async fn receive_shutdown_complete(socket: &mut TestSocket) -> (Option<i32>, Option<i32>) {
+    loop {
+        match receive_raw(socket).await {
+            Envelope::ShutdownComplete { code, signal } => return (code, signal),
+            Envelope::Ping { nonce } => send(socket, Envelope::Pong { nonce }).await,
+            Envelope::Stderr { .. }
+            | Envelope::Pong { .. }
+            | Envelope::Ack { .. }
+            | Envelope::Acp { .. } => {}
+            other => panic!("unexpected envelope before shutdown completion: {other:?}"),
+        }
+    }
+}
+
+async fn assert_resume_rejected(server: &TestServer, resume: ResumeRequest) {
+    let mut socket = server.authenticated_socket().await;
+    send(
+        &mut socket,
+        Envelope::Open {
+            tunnel_version: TUNNEL_VERSION,
+            agent: "fake".into(),
+            workspace: "project".into(),
+            client_info: ClientInfo {
+                name: "integration-test".into(),
+                version: "0".into(),
+            },
+            resume: Some(resume),
+        },
+    )
+    .await;
+    match receive_raw(&mut socket).await {
+        Envelope::Error { code, .. } => assert_eq!(code, "resume_rejected"),
+        other => panic!("expected resume rejection, got {other:?}"),
     }
 }
 
@@ -511,6 +560,35 @@ async fn invalid_resume_capability_is_rejected_without_disrupting_the_session() 
 }
 
 #[tokio::test]
+async fn tunnel_protocol_version_two_is_rejected_clearly() {
+    let server = TestServer::start().await;
+    let mut socket = server.authenticated_socket().await;
+    send(
+        &mut socket,
+        Envelope::Open {
+            tunnel_version: 2,
+            agent: "fake".into(),
+            workspace: "project".into(),
+            client_info: ClientInfo {
+                name: "integration-test".into(),
+                version: "0".into(),
+            },
+            resume: None,
+        },
+    )
+    .await;
+    match receive_raw(&mut socket).await {
+        Envelope::Error { code, message } => {
+            assert_eq!(code, "unsupported_tunnel_version");
+            assert!(message.contains("unsupported tunnel version 2"));
+            assert!(message.contains("expected 3"));
+        }
+        other => panic!("expected version rejection, got {other:?}"),
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn connect_command_keeps_stdout_protocol_pure() {
     let server = TestServer::start().await;
     let executable = std::env::var("CARGO_BIN_EXE_acp-tunnel")
@@ -524,6 +602,8 @@ async fn connect_command_keeps_stdout_protocol_pure() {
             "fake",
             "--workspace",
             "project",
+            "--shutdown-timeout-seconds",
+            "3",
         ])
         .env("ACP_TUNNEL_TOKEN", "integration-secret")
         .stdin(std::process::Stdio::piped())
@@ -616,4 +696,191 @@ async fn server_shutdown_cleans_up_the_active_child() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     server.stop().await;
+}
+
+#[tokio::test]
+async fn explicit_shutdown_closes_stdin_and_allows_a_cooperative_exit() {
+    let server = TestServer::start().await;
+    let (mut socket, resume) = server.connect_with_resume(None).await;
+    send(
+        &mut socket,
+        Envelope::Shutdown {
+            reason: acp_tunnel::protocol::ShutdownReason::ClientShutdown,
+        },
+    )
+    .await;
+    let (code, signal) = receive_shutdown_complete(&mut socket).await;
+    assert_eq!(code, Some(0));
+    assert_eq!(signal, None);
+    assert_resume_rejected(&server, resume).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_invalidates_resume_before_escalation_and_is_idempotent() {
+    let server = TestServer::start_with_agent_args(&["--uncooperative"]).await;
+    let (mut socket, resume) = server.connect_with_resume(None).await;
+    let shutdown = Envelope::Shutdown {
+        reason: acp_tunnel::protocol::ShutdownReason::ClientShutdown,
+    };
+    send(&mut socket, shutdown.clone()).await;
+    send(&mut socket, shutdown).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_resume_rejected(&server, resume).await;
+    let (code, signal) = receive_shutdown_complete(&mut socket).await;
+    assert_eq!(code, None);
+    assert_eq!(signal, Some(Signal::SIGKILL as i32));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn child_exit_racing_with_shutdown_returns_shutdown_complete() {
+    let server = TestServer::start().await;
+    let mut socket = server.connect().await;
+    send_acp(
+        &mut socket,
+        1,
+        json!({"jsonrpc":"2.0","id":"exit","method":"test/exit","params":{}}),
+    )
+    .await;
+    send(
+        &mut socket,
+        Envelope::Shutdown {
+            reason: acp_tunnel::protocol::ShutdownReason::ClientShutdown,
+        },
+    )
+    .await;
+    let (code, signal) = receive_shutdown_complete(&mut socket).await;
+    assert_eq!(code, Some(0));
+    assert_eq!(signal, None);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn explicit_shutdown_cleans_up_the_complete_process_group() {
+    let server = TestServer::start_with_agent_args(&["--spawn-grandchild"]).await;
+    let mut socket = server.connect().await;
+    let (parent_pid, grandchild_pid) = {
+        let mut parent = None;
+        let mut grandchild = None;
+        while parent.is_none() || grandchild.is_none() {
+            match receive(&mut socket).await {
+                Envelope::Stderr { payload } if payload.starts_with("fake-agent pid=") => {
+                    parent = Some(payload["fake-agent pid=".len()..].parse::<i32>().unwrap());
+                }
+                Envelope::Stderr { payload }
+                    if payload.starts_with("fake-agent grandchild-pid=") =>
+                {
+                    grandchild = Some(
+                        payload["fake-agent grandchild-pid=".len()..]
+                            .parse::<i32>()
+                            .unwrap(),
+                    );
+                }
+                Envelope::Ping { nonce } => send(&mut socket, Envelope::Pong { nonce }).await,
+                _ => {}
+            }
+        }
+        (parent.unwrap(), grandchild.unwrap())
+    };
+    send(
+        &mut socket,
+        Envelope::Shutdown {
+            reason: acp_tunnel::protocol::ShutdownReason::ClientShutdown,
+        },
+    )
+    .await;
+    let (code, signal) = receive_shutdown_complete(&mut socket).await;
+    assert_eq!(code, Some(0));
+    assert_eq!(signal, None);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    for pid in [parent_pid, grandchild_pid] {
+        while kill(Pid::from_raw(pid), None).is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process {pid} survived explicit process-group cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    server.stop().await;
+}
+
+async fn connector_signal_requests_shutdown(signal: Signal) {
+    let server = TestServer::start().await;
+    let executable = std::env::var("CARGO_BIN_EXE_acp-tunnel")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_acp-tunnel").to_owned());
+    let mut child = Command::new(executable)
+        .args([
+            "connect",
+            "--url",
+            &format!("ws://{}/v1/tunnel", server.address),
+            "--agent",
+            "fake",
+            "--workspace",
+            "project",
+            "--shutdown-timeout-seconds",
+            "3",
+        ])
+        .env("ACP_TUNNEL_TOKEN", "integration-secret")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":"ready","method":"initialize","params":{}}
+"#,
+        )
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(line.trim_end()).unwrap()["id"],
+        "ready"
+    );
+
+    let pid = i32::try_from(child.id().unwrap()).unwrap();
+    kill(Pid::from_raw(pid), signal).unwrap();
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            kill(Pid::from_raw(pid), Signal::SIGKILL).unwrap();
+            let _ = child.wait().await;
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_string(&mut stderr).await.unwrap();
+            }
+            panic!("connector did not stop after {signal:?}: {stderr}");
+        }
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).await.unwrap();
+    }
+    assert!(
+        status.success(),
+        "connector failed after {signal:?}: {stderr}"
+    );
+    drop(stdin);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn sigterm_uses_the_explicit_shutdown_path() {
+    connector_signal_requests_shutdown(Signal::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn interrupt_uses_the_explicit_shutdown_path() {
+    connector_signal_requests_shutdown(Signal::SIGINT).await;
 }

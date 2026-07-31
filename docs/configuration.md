@@ -137,3 +137,11 @@ Resume credentials are generated per tunnel, kept only in server and connector
 memory, compared in constant time, and never configured or logged. Set
 `reconnect_grace_seconds` slightly longer than the connector's
 `--reconnect-timeout-seconds` to leave room for the final connection attempt.
+
+The connector uses `--shutdown-timeout-seconds 10` by default. During
+intentional shutdown, it waits for `shutdown_complete` for this duration. A
+timeout closes the transport and produces a nonzero exit.
+
+Set the server `shutdown_timeout_seconds` high enough for the agent and its
+process group. The server closes agent stdin before it sends SIGTERM. It sends
+SIGKILL only after the shutdown timeout expires.
